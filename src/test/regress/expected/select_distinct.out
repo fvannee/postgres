@@ -244,3 +244,253 @@ SELECT null IS NOT DISTINCT FROM null as "yes";
  t
 (1 row)
 
+-- index only skip scan
+SELECT DISTINCT four FROM tenk1;
+ four 
+------
+    0
+    1
+    2
+    3
+(4 rows)
+
+SELECT DISTINCT four FROM tenk1 WHERE four = 1;
+ four 
+------
+    1
+(1 row)
+
+SELECT DISTINCT four FROM tenk1 ORDER BY four DESC;
+ four 
+------
+    3
+    2
+    1
+    0
+(4 rows)
+
+CREATE TABLE distinct_a (a int, b int, c int);
+INSERT INTO distinct_a (
+    SELECT five, hundred, 10 FROM
+    generate_series(1, 5) five,
+    generate_series(1, 100) hundred
+);
+CREATE INDEX ON distinct_a (a, b);
+ANALYZE a;
+-- test index skip scan with a condition on a non unique field
+SELECT DISTINCT ON (a) a, b FROM distinct_a WHERE b = 2;
+ a | b 
+---+---
+ 1 | 2
+ 2 | 2
+ 3 | 2
+ 4 | 2
+ 5 | 2
+(5 rows)
+
+-- test index skip scan backwards
+SELECT DISTINCT ON (a) a, b FROM distinct_a ORDER BY a DESC, b DESC;
+ a |  b  
+---+-----
+ 5 | 100
+ 4 | 100
+ 3 | 100
+ 2 | 100
+ 1 | 100
+(5 rows)
+
+DROP TABLE distinct_a;
+-- index skip scan
+SELECT DISTINCT ON (four) four, ten
+FROM tenk1 ORDER BY four;
+ four | ten 
+------+-----
+    0 |   0
+    1 |   9
+    2 |   0
+    3 |   1
+(4 rows)
+
+SELECT DISTINCT ON (four) four, ten
+FROM tenk1 WHERE four = 1 ORDER BY four;
+ four | ten 
+------+-----
+    1 |   9
+(1 row)
+
+EXPLAIN (COSTS OFF)
+SELECT DISTINCT ON (four) four, ten
+FROM tenk1 ORDER BY four;
+              QUERY PLAN              
+--------------------------------------
+ Index Scan using tenk1_four on tenk1
+   Scan mode: true
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT DISTINCT ON (four) four, ten
+FROM tenk1 WHERE four = 1 ORDER BY four;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Result
+   ->  Unique
+         ->  Bitmap Heap Scan on tenk1
+               Recheck Cond: (four = 1)
+               ->  Bitmap Index Scan on tenk1_four
+                     Index Cond: (four = 1)
+(6 rows)
+
+-- check colums order
+SELECT DISTINCT four FROM tenk1 WHERE ten = 2;
+ four 
+------
+    0
+    2
+(2 rows)
+
+CREATE INDEX tenk1_four_ten on tenk1 (four, ten);
+SELECT DISTINCT four FROM tenk1 WHERE ten = 2;
+ four 
+------
+    0
+    2
+(2 rows)
+
+SELECT DISTINCT on (four, ten) four, ten FROM tenk1 WHERE four = 0;
+ four | ten 
+------+-----
+    0 |   0
+    0 |   2
+    0 |   4
+    0 |   6
+    0 |   8
+(5 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT DISTINCT four FROM tenk1 WHERE ten = 2;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Index Only Scan using tenk1_four_ten on tenk1
+   Scan mode: true
+   Index Cond: (ten = 2)
+(3 rows)
+
+-- test uniq_distinct_pathkeys
+EXPLAIN (COSTS OFF)
+SELECT DISTINCT on (four, ten) four, ten FROM tenk1 WHERE four = 0;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Index Only Scan using tenk1_four_ten on tenk1
+   Scan mode: true
+   Index Cond: (four = 0)
+(3 rows)
+
+DROP INDEX tenk1_four_ten;
+CREATE INDEX tenk1_ten_four on tenk1 (ten, four);
+SELECT DISTINCT four FROM tenk1 WHERE ten = 2;
+ four 
+------
+    0
+    2
+(2 rows)
+
+SELECT DISTINCT on (four, ten) four, ten FROM tenk1 WHERE ten = 2;
+ four | ten 
+------+-----
+    0 |   2
+    2 |   2
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT DISTINCT four FROM tenk1 WHERE ten = 2;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Unique
+   ->  Index Only Scan using tenk1_ten_four on tenk1
+         Index Cond: (ten = 2)
+(3 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT DISTINCT on (four, ten) four, ten FROM tenk1 WHERE ten = 2;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Unique
+   ->  Index Only Scan using tenk1_ten_four on tenk1
+         Index Cond: (ten = 2)
+(3 rows)
+
+DROP INDEX tenk1_ten_four;
+-- check projection case
+SELECT DISTINCT four, four FROM tenk1 WHERE ten = 2;
+ four | four 
+------+------
+    0 |    0
+    2 |    2
+(2 rows)
+
+SELECT DISTINCT four, 1 FROM tenk1 WHERE ten = 2;
+ four | ?column? 
+------+----------
+    2 |        1
+    0 |        1
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT DISTINCT four FROM tenk1;
+                QUERY PLAN                 
+-------------------------------------------
+ Index Only Scan using tenk1_four on tenk1
+   Scan mode: true
+(2 rows)
+
+-- test cursor forward/backward movements
+BEGIN;
+DECLARE c SCROLL CURSOR FOR SELECT DISTINCT four FROM tenk1;
+FETCH FROM c;
+ four 
+------
+    0
+(1 row)
+
+FETCH BACKWARD FROM c;
+ four 
+------
+(0 rows)
+
+FETCH 5 FROM c;
+ four 
+------
+    0
+    1
+    2
+    3
+(4 rows)
+
+FETCH BACKWARD 5 FROM c;
+ four 
+------
+    3
+    2
+    1
+    0
+(4 rows)
+
+FETCH 5 FROM c;
+ four 
+------
+    0
+    1
+    2
+    3
+(4 rows)
+
+FETCH BACKWARD 5 FROM c;
+ four 
+------
+    3
+    2
+    1
+    0
+(4 rows)
+
+END;

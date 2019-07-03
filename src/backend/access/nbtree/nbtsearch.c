@@ -28,6 +28,8 @@ static void _bt_drop_lock_and_maybe_pin(IndexScanDesc scan, BTScanPos sp);
 static OffsetNumber _bt_binsrch(Relation rel, BTScanInsert key, Buffer buf);
 static bool _bt_readpage(IndexScanDesc scan, ScanDirection dir,
 						 OffsetNumber offnum);
+static bool _bt_read_closest(IndexScanDesc scan, ScanDirection dir,
+							 OffsetNumber offnum);
 static void _bt_saveitem(BTScanOpaque so, int itemIndex,
 						 OffsetNumber offnum, IndexTuple itup);
 static bool _bt_steppage(IndexScanDesc scan, ScanDirection dir);
@@ -37,7 +39,10 @@ static bool _bt_parallel_readpage(IndexScanDesc scan, BlockNumber blkno,
 static Buffer _bt_walk_left(Relation rel, Buffer buf, Snapshot snapshot);
 static bool _bt_endpoint(IndexScanDesc scan, ScanDirection dir);
 static inline void _bt_initialize_more_data(BTScanOpaque so, ScanDirection dir);
-
+static inline void _bt_update_skip_scankeys(IndexScanDesc scan,
+											Relation indexRel);
+static inline bool _bt_scankey_within_page(IndexScanDesc scan, BTScanInsert key,
+										Buffer buf, ScanDirection dir);
 
 /*
  *	_bt_drop_lock_and_maybe_pin()
@@ -1381,6 +1386,139 @@ _bt_next(IndexScanDesc scan, ScanDirection dir)
 }
 
 /*
+ *  _bt_skip() -- Skip items that have the same prefix as the most recently
+ * 				  fetched index tuple.
+ *
+ * 		The current position is set so that a subsequent call to _bt_next will
+ * 		fetch the first tuple that differs in the leading 'prefix' keys.
+ */
+bool
+_bt_skip(IndexScanDesc scan, ScanDirection dir, int prefix)
+{
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	BTStack stack;
+	Buffer buf;
+	OffsetNumber offnum;
+	BTScanPosItem *currItem;
+	Relation 	 indexRel = scan->indexRelation;
+
+	/* We want to return tuples, and we need a starting point */
+	Assert(scan->xs_want_itup);
+	Assert(scan->xs_itup);
+
+	/*
+	 * If skipScanKey is NULL then we initialize it with _bt_mkscankey,
+	 * otherwise we will just update the sk_flags / sk_argument elements
+	 * in order to eliminate repeated free/realloc.
+	 */
+	if (so->skipScanKey == NULL)
+	{
+		so->skipScanKey = _bt_mkscankey(indexRel, scan->xs_itup);
+		so->skipScanKey->keysz = prefix;
+		so->skipScanKey->scantid = NULL;
+	}
+	else
+	{
+		_bt_update_skip_scankeys(scan, indexRel);
+	}
+
+	/* Check if the next unique key can be found within the current page */
+	if (BTScanPosIsValid(so->currPos) &&
+		_bt_scankey_within_page(scan, so->skipScanKey, so->currPos.buf, dir))
+	{
+		bool keyFound = false;
+
+		LockBuffer(so->currPos.buf, BT_READ);
+		offnum = _bt_binsrch(scan->indexRelation, so->skipScanKey, so->currPos.buf);
+
+		/* Lock the page for SERIALIZABLE transactions */
+		PredicateLockPage(scan->indexRelation, BufferGetBlockNumber(so->currPos.buf),
+						  scan->xs_snapshot);
+
+		/* We know in which direction to look */
+		_bt_initialize_more_data(so, dir);
+
+		if (ScanDirectionIsForward(dir))
+		{
+			/* Move back for _bt_next */
+			offnum = OffsetNumberPrev(offnum);
+		}
+
+		/* Now read the data */
+		keyFound = _bt_read_closest(scan, dir, offnum);
+		_bt_drop_lock_and_maybe_pin(scan, &so->currPos);
+
+		if (keyFound)
+		{
+			/* set IndexTuple */
+			currItem = &so->currPos.items[so->currPos.itemIndex];
+			scan->xs_heaptid = currItem->heapTid;
+			if (scan->xs_want_itup)
+				scan->xs_itup = (IndexTuple) (so->currTuples + currItem->tupleOffset);
+			return true;
+		}
+	}
+
+	if (BTScanPosIsValid(so->currPos))
+	{
+		ReleaseBuffer(so->currPos.buf);
+		so->currPos.buf = InvalidBuffer;
+	}
+
+	/*
+	 * We haven't found scan key within the current page, so let's scan from
+	 * the root. Use _bt_search and _bt_binsrch to get the buffer and offset
+	 * number
+	 */
+	so->skipScanKey->nextkey = ScanDirectionIsForward(dir);
+	stack = _bt_search(scan->indexRelation, so->skipScanKey,
+					   &buf, BT_READ, scan->xs_snapshot);
+	_bt_freestack(stack);
+	so->currPos.buf = buf;
+	offnum = _bt_binsrch(scan->indexRelation, so->skipScanKey, buf);
+
+	/* Lock the page for SERIALIZABLE transactions */
+	PredicateLockPage(scan->indexRelation, BufferGetBlockNumber(buf),
+					  scan->xs_snapshot);
+
+	/* We know in which direction to look */
+	_bt_initialize_more_data(so, dir);
+
+	if (ScanDirectionIsForward(dir))
+		/* Move back for _bt_next */
+		offnum = OffsetNumberPrev(offnum);
+
+	/* Now read the data */
+	if (!_bt_read_closest(scan, dir, offnum))
+	{
+		/*
+		 * There's no actually-matching data on this page.  Try to advance to
+		 * the next page.  Return false if there's no matching data at all.
+		 */
+		LockBuffer(so->currPos.buf, BUFFER_LOCK_UNLOCK);
+		if (!_bt_steppage(scan, dir))
+		{
+			pfree(so->skipScanKey);
+			so->skipScanKey = NULL;
+			return false;
+		}
+	}
+	else
+	{
+		/* Drop the lock, and maybe the pin, on the current page */
+		_bt_drop_lock_and_maybe_pin(scan, &so->currPos);
+	}
+
+	/* And set IndexTuple */
+	currItem = &so->currPos.items[so->currPos.itemIndex];
+	scan->xs_heaptid = currItem->heapTid;
+	if (scan->xs_want_itup)
+		scan->xs_itup = (IndexTuple) (so->currTuples + currItem->tupleOffset);
+
+	return true;
+}
+
+/*
  *	_bt_readpage() -- Load data from current index page into so->currPos
  *
  * Caller must have pinned and read-locked so->currPos.buf; the buffer's state
@@ -1594,6 +1732,268 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum)
 	}
 
 	return (so->currPos.firstItem <= so->currPos.lastItem);
+}
+
+/*
+ *	_bt_read_closest() -- Load data from closest two items, previous and
+ *						  current on one the current index page into so->currPos
+ *
+ * 		Similar to _bt_readpage, except that it reads only a current and a
+ * 		previous item. So far it is being used for _bt_skip.
+ *
+ * 		Returns true if required two matching items found on the page, false
+ * 		otherwise.
+ */
+static bool
+_bt_read_closest(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum)
+{
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	Page		page;
+	BTPageOpaque opaque;
+	OffsetNumber minoff;
+	OffsetNumber maxoff;
+	int			itemIndex;
+	bool		continuescan;
+	int			indnatts;
+
+	/*
+	 * We must have the buffer pinned and locked, but the usual macro can't be
+	 * used here; this function is what makes it good for currPos.
+	 */
+	Assert(BufferIsValid(so->currPos.buf));
+
+	page = BufferGetPage(so->currPos.buf);
+	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+
+	/* allow next page be processed by parallel worker */
+	if (scan->parallel_scan)
+	{
+		if (ScanDirectionIsForward(dir))
+			_bt_parallel_release(scan, opaque->btpo_next);
+		else
+			_bt_parallel_release(scan, BufferGetBlockNumber(so->currPos.buf));
+	}
+
+	continuescan = true;		/* default assumption */
+	indnatts = IndexRelationGetNumberOfAttributes(scan->indexRelation);
+	minoff = P_FIRSTDATAKEY(opaque);
+	maxoff = PageGetMaxOffsetNumber(page);
+
+	/*
+	 * We note the buffer's block number so that we can release the pin later.
+	 * This allows us to re-read the buffer if it is needed again for hinting.
+	 */
+	so->currPos.currPage = BufferGetBlockNumber(so->currPos.buf);
+
+	/*
+	 * We save the LSN of the page as we read it, so that we know whether it
+	 * safe to apply LP_DEAD hints to the page later.  This allows us to drop
+	 * the pin for MVCC scans, which allows vacuum to avoid blocking.
+	 */
+	so->currPos.lsn = BufferGetLSNAtomic(so->currPos.buf);
+
+	/*
+	 * we must save the page's right-link while scanning it; this tells us
+	 * where to step right to after we're done with these items.  There is no
+	 * corresponding need for the left-link, since splits always go right.
+	 */
+	so->currPos.nextPage = opaque->btpo_next;
+
+	/* initialize tuple workspace to empty */
+	so->currPos.nextTupleOffset = 0;
+
+	/*
+	 * Now that the current page has been made consistent, the macro should be
+	 * good.
+	 */
+	Assert(BTScanPosIsPinned(so->currPos));
+
+	if (ScanDirectionIsForward(dir))
+	{
+		IndexTuple prevItup = NULL;
+		OffsetNumber prevOffNum;
+
+		/* load items[] in ascending order */
+		itemIndex = 0;
+
+		offnum = Max(offnum, minoff);
+
+		while (offnum <= maxoff)
+		{
+			ItemId		iid = PageGetItemId(page, offnum);
+			IndexTuple	itup;
+
+			/*
+			 * If the scan specifies not to return killed tuples, then we
+			 * treat a killed tuple as not passing the qual
+			 */
+			if (scan->ignore_killed_tuples && ItemIdIsDead(iid))
+			{
+				offnum = OffsetNumberNext(offnum);
+				continue;
+			}
+
+			itup = (IndexTuple) PageGetItem(page, iid);
+
+			if (_bt_checkkeys(scan, itup, indnatts, dir, &continuescan))
+			{
+				/* tuple passes all scan key conditions, so remember it */
+
+				if (prevItup == NULL)
+				{
+					_bt_saveitem(so, 0, offnum, itup);
+					itemIndex++;
+				}
+				else
+				{
+					_bt_saveitem(so, 0, prevOffNum, prevItup);
+					itemIndex++;
+
+					_bt_saveitem(so, 1, offnum, itup);
+					itemIndex++;
+
+					Assert(itemIndex <= MaxIndexTuplesPerPage);
+					so->currPos.firstItem = 0;
+					so->currPos.itemIndex = 0;
+					so->currPos.lastItem = 2;
+
+					/*
+					 * All of the closest items were found, so we can report
+					 * success
+					 */
+					return true;
+				}
+			}
+			/* When !continuescan, there can't be any more matches, so stop */
+			if (!continuescan)
+				break;
+
+			prevOffNum = offnum;
+			prevItup = itup;
+			offnum = OffsetNumberNext(offnum);
+		}
+
+		/*
+		 * We don't need to visit page to the right when the high key
+		 * indicates that no more matches will be found there.
+		 *
+		 * Checking the high key like this works out more often than you might
+		 * think.  Leaf page splits pick a split point between the two most
+		 * dissimilar tuples (this is weighed against the need to evenly share
+		 * free space).  Leaf pages with high key attribute values that can
+		 * only appear on non-pivot tuples on the right sibling page are
+		 * common.
+		 */
+		if (continuescan && !P_RIGHTMOST(opaque))
+		{
+			ItemId		iid = PageGetItemId(page, P_HIKEY);
+			IndexTuple	itup = (IndexTuple) PageGetItem(page, iid);
+			int			truncatt;
+
+			truncatt = BTreeTupleGetNAtts(itup, scan->indexRelation);
+			_bt_checkkeys(scan, itup, truncatt, dir, &continuescan);
+		}
+
+		if (!continuescan)
+			so->currPos.moreRight = false;
+
+		Assert(itemIndex <= MaxIndexTuplesPerPage);
+		so->currPos.firstItem = 0;
+		so->currPos.lastItem = itemIndex - 1;
+		so->currPos.itemIndex = 0;
+	}
+	else
+	{
+		IndexTuple prevItup = NULL;
+		OffsetNumber prevOffNum;
+
+		/* load items[] in descending order */
+		itemIndex = MaxIndexTuplesPerPage;
+
+		offnum = Min(offnum, maxoff);
+
+		while (offnum >= minoff)
+		{
+			ItemId		iid = PageGetItemId(page, offnum);
+			IndexTuple	itup;
+			bool		tuple_alive;
+			bool		passes_quals;
+
+			/*
+			 * If the scan specifies not to return killed tuples, then we
+			 * treat a killed tuple as not passing the qual.  Most of the
+			 * time, it's a win to not bother examining the tuple's index
+			 * keys, but just skip to the next tuple (previous, actually,
+			 * since we're scanning backwards).  However, if this is the first
+			 * tuple on the page, we do check the index keys, to prevent
+			 * uselessly advancing to the page to the left.  This is similar
+			 * to the high key optimization used by forward scans.
+			 */
+			if (scan->ignore_killed_tuples && ItemIdIsDead(iid))
+			{
+				Assert(offnum >= P_FIRSTDATAKEY(opaque));
+				if (offnum > P_FIRSTDATAKEY(opaque))
+				{
+					offnum = OffsetNumberPrev(offnum);
+					continue;
+				}
+
+				tuple_alive = false;
+			}
+			else
+				tuple_alive = true;
+
+			itup = (IndexTuple) PageGetItem(page, iid);
+
+			passes_quals = _bt_checkkeys(scan, itup, indnatts, dir,
+										 &continuescan);
+			if (passes_quals && tuple_alive)
+			{
+				/* tuple passes all scan key conditions, so remember it */
+				if (prevItup == NULL)
+				{
+					_bt_saveitem(so, MaxIndexTuplesPerPage - 1, offnum, itup);
+					so->currPos.lastItem = MaxIndexTuplesPerPage - 1;
+				}
+				else
+				{
+					_bt_saveitem(so, MaxIndexTuplesPerPage - 1, prevOffNum, prevItup);
+					_bt_saveitem(so, MaxIndexTuplesPerPage - 2, offnum, itup);
+
+					Assert(itemIndex <= MaxIndexTuplesPerPage);
+					so->currPos.firstItem = MaxIndexTuplesPerPage - 2;
+					so->currPos.itemIndex = MaxIndexTuplesPerPage - 1;
+					so->currPos.lastItem = MaxIndexTuplesPerPage - 2;
+
+					/*
+					 * All of the closest items were found, so we can report
+					 * success
+					 */
+					return true;
+				}
+
+				itemIndex--;
+			}
+			if (!continuescan)
+			{
+				/* there can't be any more matches, so stop */
+				so->currPos.moreLeft = false;
+				break;
+			}
+
+			prevOffNum = offnum;
+			prevItup = itup;
+			offnum = OffsetNumberPrev(offnum);
+		}
+
+		Assert(itemIndex >= 0);
+		so->currPos.firstItem = itemIndex;
+		so->currPos.lastItem = MaxIndexTuplesPerPage - 1;
+		so->currPos.itemIndex = MaxIndexTuplesPerPage - 1;
+	}
+
+	/* Not all of the closest items were found */
+	return false;
 }
 
 /* Save an index item into so->currPos.items[itemIndex] */
@@ -2248,4 +2648,53 @@ _bt_initialize_more_data(BTScanOpaque so, ScanDirection dir)
 	}
 	so->numKilled = 0;			/* just paranoia */
 	so->markItemIndex = -1;		/* ditto */
+}
+
+/*
+ * _bt_update_skip_scankeys() -- set up a new values for the existing scankeys
+ * 								 based on the current index tuple
+ */
+static inline void
+_bt_update_skip_scankeys(IndexScanDesc scan, Relation indexRel)
+{
+	TupleDesc		itupdesc;
+	int				indnkeyatts, i;
+	BTScanOpaque 	so = (BTScanOpaque) scan->opaque;
+	ScanKey			scankeys = so->skipScanKey->scankeys;
+
+	itupdesc = RelationGetDescr(indexRel);
+	indnkeyatts = IndexRelationGetNumberOfKeyAttributes(indexRel);
+	for (i = 0; i < indnkeyatts; i++)
+	{
+		Datum datum;
+		bool null;
+		int flags;
+
+		datum = index_getattr(scan->xs_itup, i + 1, itupdesc, &null);
+		flags = (null ? SK_ISNULL : 0) |
+				(indexRel->rd_indoption[i] << SK_BT_INDOPTION_SHIFT);
+		scankeys[i].sk_flags = flags;
+		scankeys[i].sk_argument = datum;
+	}
+}
+
+/*
+ * _bt_scankey_within_page() -- check if the provided scankey could be found
+ * 								within a page, specified by the buffer.
+ */
+static inline bool
+_bt_scankey_within_page(IndexScanDesc scan, BTScanInsert key,
+						Buffer buf, ScanDirection dir)
+{
+	OffsetNumber low, high, compare_offset;
+	Page page = BufferGetPage(buf);
+	BTPageOpaque opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	int 		 compare_value = ScanDirectionIsForward(dir) ? 0 : 1;
+
+	low = P_FIRSTDATAKEY(opaque);
+	high = PageGetMaxOffsetNumber(page);
+	compare_offset = ScanDirectionIsForward(dir) ? high : low;
+
+	return _bt_compare(scan->indexRelation,
+					   key, page, compare_offset) > compare_value;
 }
