@@ -65,6 +65,7 @@ IndexOnlyNext(IndexOnlyScanState *node)
 	IndexScanDesc scandesc;
 	TupleTableSlot *slot;
 	ItemPointer tid;
+	IndexOnlyScan *indexonlyscan = (IndexOnlyScan *) node->ss.ps.plan;
 
 	/*
 	 * extract necessary information from index scan node
@@ -72,7 +73,7 @@ IndexOnlyNext(IndexOnlyScanState *node)
 	estate = node->ss.ps.state;
 	direction = estate->es_direction;
 	/* flip direction if this is an overall backward scan */
-	if (ScanDirectionIsBackward(((IndexOnlyScan *) node->ss.ps.plan)->indexorderdir))
+	if (ScanDirectionIsBackward(indexonlyscan->indexorderdir))
 	{
 		if (ScanDirectionIsForward(direction))
 			direction = BackwardScanDirection;
@@ -113,6 +114,45 @@ IndexOnlyNext(IndexOnlyScanState *node)
 						 node->ioss_NumScanKeys,
 						 node->ioss_OrderByKeys,
 						 node->ioss_NumOrderByKeys);
+	}
+
+	/*
+	 * Check if we need to skip to the next key prefix, because we've been
+	 * asked to implement DISTINCT.
+	 */
+	if (node->ioss_SkipPrefixSize > 0)
+	{
+		bool startscan = false;
+
+		/*
+		 * When fetching a cursor in the direction opposite to a general scan
+		 * direction, the result must be what normal fetching should have
+		 * returned, but in reversed order. In other words, return the last or
+		 * first scanned tuple in a DISTINCT set, depending on a cursor
+		 * direction. Skip to that tuple before returning the first tuple.
+		 */
+		if (direction * indexonlyscan->indexorderdir < 0 &&
+			!node->ioss_FirstTupleEmitted)
+		{
+			if (index_getnext_tid(scandesc, direction))
+			{
+				node->ioss_FirstTupleEmitted = true;
+				startscan = true;
+			}
+		}
+
+		if (node->ioss_FirstTupleEmitted &&
+			!index_skip(scandesc, direction, indexonlyscan->indexorderdir,
+						startscan, node->ioss_SkipPrefixSize))
+		{
+			/* Reached end of index. At this point currPos is invalidated,
+			 * and we need to reset ioss_FirstTupleEmitted, since otherwise
+			 * after going backwards, reaching the end of index, and going
+			 * forward again we apply skip again. It would be incorrect and
+			 * lead to an extra skipped item. */
+			node->ioss_FirstTupleEmitted = false;
+			return ExecClearTuple(slot);
+		}
 	}
 
 	/*
@@ -249,6 +289,8 @@ IndexOnlyNext(IndexOnlyScanState *node)
 			PredicateLockPage(scandesc->heapRelation,
 							  ItemPointerGetBlockNumber(tid),
 							  estate->es_snapshot);
+
+		node->ioss_FirstTupleEmitted = true;
 
 		return slot;
 	}
@@ -500,6 +542,8 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	indexstate->ss.ps.plan = (Plan *) node;
 	indexstate->ss.ps.state = estate;
 	indexstate->ss.ps.ExecProcNode = ExecIndexOnlyScan;
+	indexstate->ioss_SkipPrefixSize = node->indexskipprefixsize;
+	indexstate->ioss_FirstTupleEmitted = false;
 
 	/*
 	 * Miscellaneous initialization
