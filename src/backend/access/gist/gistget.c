@@ -591,7 +591,7 @@ getNextNearest(IndexScanDesc scan)
  * gistgettuple() -- Get the next tuple in the scan
  */
 bool
-gistgettuple(IndexScanDesc scan, ScanDirection dir)
+gistgettuple(IndexScanDesc scan, ScanDirection dir, bool forceSkip)
 {
 	GISTScanOpaque so = (GISTScanOpaque) scan->opaque;
 

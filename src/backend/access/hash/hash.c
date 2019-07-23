@@ -274,7 +274,7 @@ hashinsert(Relation rel, Datum *values, bool *isnull,
  *	hashgettuple() -- Get the next tuple in the scan.
  */
 bool
-hashgettuple(IndexScanDesc scan, ScanDirection dir)
+hashgettuple(IndexScanDesc scan, ScanDirection dir, bool forceSkip)
 {
 	HashScanOpaque so = (HashScanOpaque) scan->opaque;
 	bool		res;

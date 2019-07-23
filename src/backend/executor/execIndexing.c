@@ -728,7 +728,7 @@ retry:
 	index_scan = index_beginscan(heap, index, &DirtySnapshot, indnkeyatts, 0);
 	index_rescan(index_scan, scankeys, indnkeyatts, NULL, 0);
 
-	while (index_getnext_slot(index_scan, ForwardScanDirection, existing_slot))
+	while (index_getnext_slot(index_scan, ForwardScanDirection, existing_slot, false))
 	{
 		TransactionId xwait;
 		XLTW_Oper	reason_wait;

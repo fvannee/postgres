@@ -113,30 +113,16 @@ IndexOnlyNext(IndexOnlyScanState *node)
 						 node->ioss_NumScanKeys,
 						 node->ioss_OrderByKeys,
 						 node->ioss_NumOrderByKeys);
-	}
-
-	/*
-	 * Check if we need to skip to the next key prefix, because we've been
-	 * asked to implement DISTINCT.
-	 */
-	if (node->ioss_SkipPrefixSize > 0 && node->ioss_FirstTupleEmitted)
-	{
-		if (!index_skip(scandesc, direction, node->ioss_SkipPrefixSize))
-		{
-			/* Reached end of index. At this point currPos is invalidated,
-			 * and we need to reset ioss_FirstTupleEmitted, since otherwise
-			 * after going backwards, reaching the end of index, and going
-			 * forward again we apply skip again. It would be incorrect and
-			 * lead to an extra skipped item. */
-			node->ioss_FirstTupleEmitted = false;
-			return ExecClearTuple(slot);
-		}
+		if (node->ioss_SkipPrefixSize > 0)
+			index_skip(node->ioss_ScanDesc,
+					   ((IndexOnlyScan *) node->ss.ps.plan)->indexorderdir, node->ioss_SkipPrefixSize,
+					   ScanDirectionIsForward(((IndexOnlyScan *) node->ss.ps.plan)->indexorderdir) ? ScanModeMin : ScanModeMax);
 	}
 
 	/*
 	 * OK, now that we have what we need, fetch the next tuple.
 	 */
-	while ((tid = index_getnext_tid(scandesc, direction)) != NULL)
+    while ((tid = index_getnext_tid(scandesc, direction, node->ioss_SkipPrefixSize > 0)) != NULL)
 	{
 		bool		tuple_from_heap = false;
 
@@ -373,9 +359,15 @@ ExecReScanIndexOnlyScan(IndexOnlyScanState *node)
 
 	/* reset index scan */
 	if (node->ioss_ScanDesc)
+    {
 		index_rescan(node->ioss_ScanDesc,
 					 node->ioss_ScanKeys, node->ioss_NumScanKeys,
 					 node->ioss_OrderByKeys, node->ioss_NumOrderByKeys);
+		if (node->ioss_SkipPrefixSize > 0)
+			index_skip(node->ioss_ScanDesc,
+					   ((IndexOnlyScan *) node->ss.ps.plan)->indexorderdir, node->ioss_SkipPrefixSize,
+					   ScanDirectionIsForward(((IndexOnlyScan *) node->ss.ps.plan)->indexorderdir) ? ScanModeMin : ScanModeMax);
+    }
 
 	ExecScanReScan(&node->ss);
 }

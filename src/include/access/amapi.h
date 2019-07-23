@@ -128,11 +128,12 @@ typedef void (*amrescan_function) (IndexScanDesc scan,
 
 /* next valid tuple */
 typedef bool (*amgettuple_function) (IndexScanDesc scan,
-									 ScanDirection direction);
+                                     ScanDirection direction,
+                                     bool forceSkip);
 
 /* skip past duplicates in a given prefix */
 typedef bool (*amskip_function) (IndexScanDesc scan,
-								 ScanDirection dir, int prefix);
+                                 ScanDirection dir, int prefix, ScanMode mode);
 
 /* fetch all valid tuples */
 typedef int64 (*amgetbitmap_function) (IndexScanDesc scan,

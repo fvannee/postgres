@@ -349,7 +349,7 @@ extern bool hashinsert(Relation rel, Datum *values, bool *isnull,
 					   ItemPointer ht_ctid, Relation heapRel,
 					   IndexUniqueCheck checkUnique,
 					   struct IndexInfo *indexInfo);
-extern bool hashgettuple(IndexScanDesc scan, ScanDirection dir);
+extern bool hashgettuple(IndexScanDesc scan, ScanDirection dir, bool forceSkip);
 extern int64 hashgetbitmap(IndexScanDesc scan, TIDBitmap *tbm);
 extern IndexScanDesc hashbeginscan(Relation rel, int nkeys, int norderbys);
 extern void hashrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,

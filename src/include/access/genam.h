@@ -15,6 +15,7 @@
 #define GENAM_H
 
 #include "access/sdir.h"
+#include "access/smode.h"
 #include "access/skey.h"
 #include "nodes/tidbitmap.h"
 #include "storage/lockdefs.h"
@@ -159,11 +160,12 @@ extern IndexScanDesc index_beginscan_parallel(Relation heaprel,
 											  Relation indexrel, int nkeys, int norderbys,
 											  ParallelIndexScanDesc pscan);
 extern ItemPointer index_getnext_tid(IndexScanDesc scan,
-									 ScanDirection direction);
+                                     ScanDirection direction,
+                                     bool forceSkip);
 struct TupleTableSlot;
 extern bool index_fetch_heap(IndexScanDesc scan, struct TupleTableSlot *slot);
 extern bool index_getnext_slot(IndexScanDesc scan, ScanDirection direction,
-							   struct TupleTableSlot *slot);
+                               struct TupleTableSlot *slot, bool forceSkip);
 extern int64 index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap);
 
 extern IndexBulkDeleteResult *index_bulk_delete(IndexVacuumInfo *info,
@@ -173,7 +175,7 @@ extern IndexBulkDeleteResult *index_bulk_delete(IndexVacuumInfo *info,
 extern IndexBulkDeleteResult *index_vacuum_cleanup(IndexVacuumInfo *info,
 												   IndexBulkDeleteResult *stats);
 extern bool index_can_return(Relation indexRelation, int attno);
-extern bool index_skip(IndexScanDesc scan, ScanDirection direction, int prefix);
+extern bool index_skip(IndexScanDesc scan, ScanDirection direction, int prefix, ScanMode mode);
 extern RegProcedure index_getprocid(Relation irel, AttrNumber attnum,
 									uint16 procnum);
 extern FmgrInfo *index_getprocinfo(Relation irel, AttrNumber attnum,
