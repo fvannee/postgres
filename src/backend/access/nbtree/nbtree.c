@@ -214,7 +214,7 @@ btinsert(Relation rel, Datum *values, bool *isnull,
  *	btgettuple() -- Get the next tuple in the scan.
  */
 bool
-btgettuple(IndexScanDesc scan, ScanDirection dir)
+btgettuple(IndexScanDesc scan, ScanDirection dir, bool forceSkip)
 {
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	bool		res;
@@ -272,7 +272,7 @@ btgettuple(IndexScanDesc scan, ScanDirection dir)
 			/*
 			 * Now continue the scan.
 			 */
-			res = _bt_next(scan, dir);
+			res = _bt_next(scan, dir, forceSkip);
 		}
 
 		/* If we have a tuple, return it ... */
@@ -326,7 +326,7 @@ btgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 				if (++so->currPos.itemIndex > so->currPos.lastItem)
 				{
 					/* let _bt_next do the heavy lifting */
-					if (!_bt_next(scan, ForwardScanDirection))
+					if (!_bt_next(scan, ForwardScanDirection, false))
 						break;
 				}
 
@@ -382,6 +382,7 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 	so->currTuples = so->markTuples = NULL;
 
 	so->skipScanKey = NULL;
+	so->skipData = NULL;
 
 	scan->xs_itupdesc = RelationGetDescr(rel);
 
@@ -454,10 +455,20 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
  * btskip() -- skip to the beginning of the next key prefix
  */
 bool
-btskip(IndexScanDesc scan, ScanDirection direction,
-	   ScanDirection indexdir, bool start, int prefix)
+btskip(IndexScanDesc scan, ScanDirection direction, int prefix, ScanMode mode)
 {
-	return _bt_skip(scan, direction, indexdir, start, prefix);
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	if (so->skipData == NULL)
+	{
+		so->skipData = (BTSkip) palloc(sizeof(BTSkipData));
+	}
+	so->skipData->curDir = so->skipData->overallDir = direction;
+	so->skipData->prefix = prefix;
+	so->skipData->overallMode = so->skipData->curMode = mode;
+	so->skipData->skipScanKey.keysz = so->skipData->skipScanFwdKey.keysz = so->skipData->skipScanBwdKey.keysz = 0;
+	so->skipData->compareResult.skCmpResult = -2;
+	so->skipData->compareResult.prefixCmpResult = -2;
+	return true;
 }
 
 /*

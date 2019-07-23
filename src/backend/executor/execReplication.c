@@ -146,7 +146,7 @@ retry:
 	index_rescan(scan, skey, IndexRelationGetNumberOfKeyAttributes(idxrel), NULL, 0);
 
 	/* Try to find the tuple */
-	if (index_getnext_slot(scan, ForwardScanDirection, outslot))
+	if (index_getnext_slot(scan, ForwardScanDirection, outslot, false))
 	{
 		found = true;
 		ExecMaterializeSlot(outslot);

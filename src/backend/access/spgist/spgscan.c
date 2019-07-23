@@ -907,7 +907,7 @@ storeGettuple(SpGistScanOpaque so, ItemPointer heapPtr,
 }
 
 bool
-spggettuple(IndexScanDesc scan, ScanDirection dir)
+spggettuple(IndexScanDesc scan, ScanDirection dir, bool forceSkip)
 {
 	SpGistScanOpaque so = (SpGistScanOpaque) scan->opaque;
 

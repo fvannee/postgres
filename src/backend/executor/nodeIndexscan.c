@@ -127,48 +127,16 @@ IndexNext(IndexScanState *node)
 			index_rescan(scandesc,
 						 node->iss_ScanKeys, node->iss_NumScanKeys,
 						 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
-	}
-
-	/*
-	 * Check if we need to skip to the next key prefix, because we've been
-	 * asked to implement DISTINCT.
-	 */
-	if (node->iss_SkipPrefixSize > 0)
-	{
-		bool startscan = false;
-
-		/*
-		 * If advancing direction is different from index direction, we must
-		 * skip right away, but _bt_skip requires a starting point.
-		 */
-		if (direction * indexscan->indexorderdir < 0 &&
-			!node->iss_FirstTupleEmitted)
-		{
-			if (index_getnext_slot(scandesc, direction, slot))
-			{
-				node->iss_FirstTupleEmitted = true;
-				startscan = true;
-			}
-		}
-
-		if (node->iss_FirstTupleEmitted &&
-			!index_skip(scandesc, direction, indexscan->indexorderdir,
-						startscan, node->iss_SkipPrefixSize))
-		{
-			/* Reached end of index. At this point currPos is invalidated,
-			 * and we need to reset iss_FirstTupleEmitted, since otherwise
-			 * after going backwards, reaching the end of index, and going
-			 * forward again we apply skip again. It would be incorrect and
-			 * lead to an extra skipped item. */
-			node->iss_FirstTupleEmitted = false;
-			return ExecClearTuple(slot);
-		}
+		if (node->iss_SkipPrefixSize > 0)
+			index_skip(node->iss_ScanDesc,
+					   ((IndexScan *) node->ss.ps.plan)->indexorderdir, node->iss_SkipPrefixSize,
+					   ScanDirectionIsForward(((IndexScan *) node->ss.ps.plan)->indexorderdir) ? ScanModeMin : ScanModeMax);
 	}
 
 	/*
 	 * ok, now that we have what we need, fetch the next tuple.
 	 */
-	while (index_getnext_slot(scandesc, direction, slot))
+	while (index_getnext_slot(scandesc, direction, slot, node->iss_SkipPrefixSize > 0))
 	{
 		CHECK_FOR_INTERRUPTS();
 
@@ -259,6 +227,10 @@ IndexNextWithReorder(IndexScanState *node)
 			index_rescan(scandesc,
 						 node->iss_ScanKeys, node->iss_NumScanKeys,
 						 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
+		if (node->iss_SkipPrefixSize > 0)
+			index_skip(node->iss_ScanDesc,
+					   ((IndexScan *) node->ss.ps.plan)->indexorderdir, node->iss_SkipPrefixSize,
+					   ScanDirectionIsForward(((IndexScan *) node->ss.ps.plan)->indexorderdir) ? ScanModeMin : ScanModeMax);
 	}
 
 	for (;;)
@@ -300,7 +272,7 @@ IndexNextWithReorder(IndexScanState *node)
 		 * Fetch next tuple from the index.
 		 */
 next_indextuple:
-		if (!index_getnext_slot(scandesc, ForwardScanDirection, slot))
+		if (!index_getnext_slot(scandesc, ForwardScanDirection, slot, node->iss_SkipPrefixSize > 0))
 		{
 			/*
 			 * No more tuples from the index.  But we still need to drain any
@@ -619,9 +591,15 @@ ExecReScanIndexScan(IndexScanState *node)
 
 	/* reset index scan */
 	if (node->iss_ScanDesc)
+	{
 		index_rescan(node->iss_ScanDesc,
 					 node->iss_ScanKeys, node->iss_NumScanKeys,
 					 node->iss_OrderByKeys, node->iss_NumOrderByKeys);
+		if (node->iss_SkipPrefixSize > 0)
+			index_skip(node->iss_ScanDesc,
+					   ((IndexScan *) node->ss.ps.plan)->indexorderdir, node->iss_SkipPrefixSize,
+					   ScanDirectionIsForward(((IndexScan *) node->ss.ps.plan)->indexorderdir) ? ScanModeMin : ScanModeMax);
+	}
 	node->iss_ReachedEnd = false;
 
 	ExecScanReScan(&node->ss);

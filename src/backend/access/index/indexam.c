@@ -507,7 +507,7 @@ index_beginscan_parallel(Relation heaprel, Relation indexrel, int nkeys,
  * ----------------
  */
 ItemPointer
-index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
+index_getnext_tid(IndexScanDesc scan, ScanDirection direction, bool forceSkip)
 {
 	bool		found;
 
@@ -522,7 +522,7 @@ index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
 	 * scan->xs_recheck and possibly scan->xs_itup/scan->xs_hitup, though we
 	 * pay no attention to those fields here.
 	 */
-	found = scan->indexRelation->rd_indam->amgettuple(scan, direction);
+	found = scan->indexRelation->rd_indam->amgettuple(scan, direction, forceSkip);
 
 	/* Reset kill flag immediately for safety */
 	scan->kill_prior_tuple = false;
@@ -605,7 +605,7 @@ index_fetch_heap(IndexScanDesc scan, TupleTableSlot *slot)
  * ----------------
  */
 bool
-index_getnext_slot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *slot)
+index_getnext_slot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *slot, bool forceSkip)
 {
 	for (;;)
 	{
@@ -614,7 +614,7 @@ index_getnext_slot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *
 			ItemPointer tid;
 
 			/* Time to fetch the next TID from the index */
-			tid = index_getnext_tid(scan, direction);
+			tid = index_getnext_tid(scan, direction, forceSkip);
 
 			/* If we're out of index entries, we're done */
 			if (tid == NULL)
@@ -739,13 +739,11 @@ index_can_return(Relation indexRelation, int attno)
  * ----------------
  */
 bool
-index_skip(IndexScanDesc scan, ScanDirection direction,
-		   ScanDirection indexdir, bool scanstart, int prefix)
+index_skip(IndexScanDesc scan, ScanDirection direction, int prefix, ScanMode mode)
 {
 	SCAN_CHECKS;
 
-	return scan->indexRelation->rd_indam->amskip(scan, direction,
-												 indexdir, scanstart, prefix);
+	return scan->indexRelation->rd_indam->amskip(scan, direction, prefix, mode);
 }
 
 /* ----------------

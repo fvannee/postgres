@@ -445,7 +445,7 @@ extern XLogRecPtr gistXLogSplit(bool page_is_leaf,
 								Buffer leftchild, bool markfollowright);
 
 /* gistget.c */
-extern bool gistgettuple(IndexScanDesc scan, ScanDirection dir);
+extern bool gistgettuple(IndexScanDesc scan, ScanDirection dir, bool forceSkip);
 extern int64 gistgetbitmap(IndexScanDesc scan, TIDBitmap *tbm);
 extern bool gistcanreturn(Relation index, int attno);
 

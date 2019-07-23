@@ -47,7 +47,7 @@ static bool _bt_compare_scankey_args(IndexScanDesc scan, ScanKey op,
 									 ScanKey leftarg, ScanKey rightarg,
 									 bool *result);
 static bool _bt_fix_scankey_strategy(ScanKey skey, int16 *indoption);
-static void _bt_mark_scankey_required(ScanKey skey);
+static void _bt_mark_scankey_required(ScanKey skey, int forwardReqFlag, int backwardReqFlag, bool includeEqual);
 static bool _bt_check_rowcompare(ScanKey skey,
 								 IndexTuple tuple, int tupnatts, TupleDesc tupdesc,
 								 ScanDirection dir, bool *continuescan);
@@ -143,7 +143,7 @@ _bt_mkscankey(Relation rel, IndexTuple itup)
 		ScanKeyEntryInitializeWithInfo(&skey[i],
 									   flags,
 									   (AttrNumber) (i + 1),
-									   InvalidStrategy,
+									   BTEqualStrategyNumber,
 									   InvalidOid,
 									   rel->rd_indcollation[i],
 									   procinfo,
@@ -747,7 +747,7 @@ _bt_preprocess_keys(IndexScanDesc scan)
 	int			numberOfKeys = scan->numberOfKeys;
 	int16	   *indoption = scan->indexRelation->rd_indoption;
 	int			new_numberOfKeys;
-	int			numberOfEqualCols;
+	int			numberOfEqualCols, numberOfEqualColsSincePrefix;
 	ScanKey		inkeys;
 	ScanKey		outkeys;
 	ScanKey		cur;
@@ -756,6 +756,7 @@ _bt_preprocess_keys(IndexScanDesc scan)
 	int			i,
 				j;
 	AttrNumber	attno;
+	int			prefix = 0;
 
 	/* initialize result variables */
 	so->qual_ok = true;
@@ -763,6 +764,11 @@ _bt_preprocess_keys(IndexScanDesc scan)
 
 	if (numberOfKeys < 1)
 		return;					/* done if qual-less scan */
+
+	if (so->skipData != NULL)
+	{
+		prefix = so->skipData->prefix;
+	}
 
 	/*
 	 * Read so->arrayKeyData if array keys are present, else scan->keyData
@@ -788,7 +794,9 @@ _bt_preprocess_keys(IndexScanDesc scan)
 		so->numberOfKeys = 1;
 		/* We can mark the qual as required if it's for first index col */
 		if (cur->sk_attno == 1)
-			_bt_mark_scankey_required(outkeys);
+			_bt_mark_scankey_required(outkeys, SK_BT_REQFWD, SK_BT_REQBKWD, true);
+		if (cur->sk_attno <= prefix)
+			_bt_mark_scankey_required(outkeys, SK_BT_REQSKIPFWD, SK_BT_REQSKIPBKWD, false);
 		return;
 	}
 
@@ -797,6 +805,7 @@ _bt_preprocess_keys(IndexScanDesc scan)
 	 */
 	new_numberOfKeys = 0;
 	numberOfEqualCols = 0;
+	numberOfEqualColsSincePrefix = 0;
 
 	/*
 	 * Initialize for processing of keys for attr 1.
@@ -832,6 +841,7 @@ _bt_preprocess_keys(IndexScanDesc scan)
 		if (i == numberOfKeys || cur->sk_attno != attno)
 		{
 			int			priorNumberOfEqualCols = numberOfEqualCols;
+			int			priorNumberOfEqualColsSincePrefix = numberOfEqualColsSincePrefix;
 
 			/* check input keys are correctly ordered */
 			if (i < numberOfKeys && cur->sk_attno < attno)
@@ -882,6 +892,8 @@ _bt_preprocess_keys(IndexScanDesc scan)
 				}
 				/* track number of attrs for which we have "=" keys */
 				numberOfEqualCols++;
+				if (attno > prefix)
+					numberOfEqualColsSincePrefix++;
 			}
 
 			/* try to keep only one of <, <= */
@@ -931,7 +943,9 @@ _bt_preprocess_keys(IndexScanDesc scan)
 
 					memcpy(outkey, xform[j], sizeof(ScanKeyData));
 					if (priorNumberOfEqualCols == attno - 1)
-						_bt_mark_scankey_required(outkey);
+						_bt_mark_scankey_required(outkey, SK_BT_REQFWD, SK_BT_REQBKWD, true);
+					if (attno <= prefix || priorNumberOfEqualColsSincePrefix == attno - prefix - 1)
+						_bt_mark_scankey_required(outkey, SK_BT_REQSKIPFWD, SK_BT_REQSKIPBKWD, false);
 				}
 			}
 
@@ -956,7 +970,9 @@ _bt_preprocess_keys(IndexScanDesc scan)
 
 			memcpy(outkey, cur, sizeof(ScanKeyData));
 			if (numberOfEqualCols == attno - 1)
-				_bt_mark_scankey_required(outkey);
+				_bt_mark_scankey_required(outkey, SK_BT_REQFWD, SK_BT_REQBKWD, true);
+			if (attno <= prefix || numberOfEqualColsSincePrefix == attno - prefix - 1)
+				_bt_mark_scankey_required(outkey, SK_BT_REQSKIPFWD, SK_BT_REQSKIPBKWD, false);
 
 			/*
 			 * We don't support RowCompare using equality; such a qual would
@@ -999,7 +1015,9 @@ _bt_preprocess_keys(IndexScanDesc scan)
 
 				memcpy(outkey, cur, sizeof(ScanKeyData));
 				if (numberOfEqualCols == attno - 1)
-					_bt_mark_scankey_required(outkey);
+					_bt_mark_scankey_required(outkey, SK_BT_REQFWD, SK_BT_REQBKWD, true);
+				if (attno <= prefix || numberOfEqualColsSincePrefix == attno - prefix - 1)
+					_bt_mark_scankey_required(outkey, SK_BT_REQSKIPFWD, SK_BT_REQSKIPBKWD, false);
 			}
 		}
 	}
@@ -1297,22 +1315,30 @@ _bt_fix_scankey_strategy(ScanKey skey, int16 *indoption)
  * anyway on a rescan.  Something to keep an eye on though.
  */
 static void
-_bt_mark_scankey_required(ScanKey skey)
+_bt_mark_scankey_required(ScanKey skey, int forwardReqFlag, int backwardReqFlag, bool includeEqual)
 {
 	int			addflags;
+	includeEqual = true;
 
 	switch (skey->sk_strategy)
 	{
 		case BTLessStrategyNumber:
 		case BTLessEqualStrategyNumber:
-			addflags = SK_BT_REQFWD;
+			addflags = forwardReqFlag;
 			break;
 		case BTEqualStrategyNumber:
-			addflags = SK_BT_REQFWD | SK_BT_REQBKWD;
+			if (includeEqual)
+			{
+				addflags = forwardReqFlag | backwardReqFlag;
+			}
+			else
+			{
+				addflags = 0;
+			}
 			break;
 		case BTGreaterEqualStrategyNumber:
 		case BTGreaterStrategyNumber:
-			addflags = SK_BT_REQBKWD;
+			addflags = backwardReqFlag;
 			break;
 		default:
 			elog(ERROR, "unrecognized StrategyNumber: %d",
@@ -1355,17 +1381,22 @@ _bt_mark_scankey_required(ScanKey skey)
  */
 bool
 _bt_checkkeys(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
-			  ScanDirection dir, bool *continuescan)
+			  ScanDirection dir, bool *continuescan, int *prefixSkipIndex)
 {
 	TupleDesc	tupdesc;
 	BTScanOpaque so;
 	int			keysz;
 	int			ikey;
 	ScanKey		key;
+	int pfx;
+
+	if (prefixSkipIndex == NULL)
+		prefixSkipIndex = &pfx;
 
 	Assert(BTreeTupleGetNAtts(tuple, scan->indexRelation) == tupnatts);
 
 	*continuescan = true;		/* default assumption */
+	*prefixSkipIndex = -1;
 
 	tupdesc = RelationGetDescr(scan->indexRelation);
 	so = (BTScanOpaque) scan->opaque;
@@ -1394,7 +1425,7 @@ _bt_checkkeys(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
 		{
 			if (_bt_check_rowcompare(key, tuple, tupnatts, tupdesc, dir,
 									 continuescan))
-				continue;
+				continue; // @todo rowcompare set skipindex
 			return false;
 		}
 
@@ -1430,6 +1461,13 @@ _bt_checkkeys(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
 					 ScanDirectionIsBackward(dir))
 				*continuescan = false;
 
+			if ((key->sk_flags & SK_BT_REQSKIPFWD) &&
+				ScanDirectionIsForward(dir))
+				*prefixSkipIndex = key->sk_attno - 1;
+			else if ((key->sk_flags & SK_BT_REQSKIPBKWD) &&
+					 ScanDirectionIsBackward(dir))
+				*prefixSkipIndex = key->sk_attno - 1;
+
 			/*
 			 * In any case, this indextuple doesn't match the qual.
 			 */
@@ -1453,6 +1491,10 @@ _bt_checkkeys(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
 				if ((key->sk_flags & (SK_BT_REQFWD | SK_BT_REQBKWD)) &&
 					ScanDirectionIsBackward(dir))
 					*continuescan = false;
+
+				if ((key->sk_flags & (SK_BT_REQSKIPFWD | SK_BT_REQSKIPBKWD)) &&
+					ScanDirectionIsBackward(dir))
+					*prefixSkipIndex = key->sk_attno - 1;
 			}
 			else
 			{
@@ -1469,6 +1511,9 @@ _bt_checkkeys(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
 				if ((key->sk_flags & (SK_BT_REQFWD | SK_BT_REQBKWD)) &&
 					ScanDirectionIsForward(dir))
 					*continuescan = false;
+				if ((key->sk_flags & (SK_BT_REQSKIPFWD | SK_BT_REQSKIPBKWD)) &&
+					ScanDirectionIsBackward(dir))
+					*prefixSkipIndex = key->sk_attno - 1;
 			}
 
 			/*
@@ -1498,6 +1543,206 @@ _bt_checkkeys(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
 			else if ((key->sk_flags & SK_BT_REQBKWD) &&
 					 ScanDirectionIsBackward(dir))
 				*continuescan = false;
+
+			if ((key->sk_flags & SK_BT_REQSKIPFWD) &&
+				ScanDirectionIsForward(dir))
+				*prefixSkipIndex = key->sk_attno - 1;
+			else if ((key->sk_flags & SK_BT_REQSKIPBKWD) &&
+					 ScanDirectionIsBackward(dir))
+				*prefixSkipIndex = key->sk_attno - 1;
+
+			/*
+			 * In any case, this indextuple doesn't match the qual.
+			 */
+			return false;
+		}
+	}
+
+	/* If we get here, the tuple passes all index quals. */
+	return true;
+}
+
+bool
+_bt_checkkeys_threeway(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
+			  ScanDirection dir, bool *continuescan, int *prefixSkipIndex)
+{
+	TupleDesc	tupdesc;
+	BTScanOpaque so;
+	int			keysz;
+	int			ikey;
+	ScanKey		key;
+	int pfx;
+	BTScanInsert keys;
+
+	if (prefixSkipIndex == NULL)
+		prefixSkipIndex = &pfx;
+
+	Assert(BTreeTupleGetNAtts(tuple, scan->indexRelation) == tupnatts);
+
+	*continuescan = true;		/* default assumption */
+	*prefixSkipIndex = -1;
+
+	tupdesc = RelationGetDescr(scan->indexRelation);
+	so = (BTScanOpaque) scan->opaque;
+	if (ScanDirectionIsForward(dir))
+		keys = &so->skipData->skipScanBwdKey;
+	else
+		keys = &so->skipData->skipScanFwdKey;
+
+	keysz = keys->keysz;
+
+	for (key = keys->scankeys, ikey = 0; ikey < keysz; key++, ikey++)
+	{
+		Datum		datum;
+		bool		isNull;
+		int		cmpresult;
+
+		if (key->sk_attno == 0)
+			continue;
+
+		if (key->sk_attno > tupnatts)
+		{
+			/*
+			 * This attribute is truncated (must be high key).  The value for
+			 * this attribute in the first non-pivot tuple on the page to the
+			 * right could be any possible value.  Assume that truncated
+			 * attribute passes the qual.
+			 */
+			Assert(ScanDirectionIsForward(dir));
+			continue;
+		}
+
+		/* row-comparison keys need special processing */
+		Assert((key->sk_flags & SK_ROW_HEADER) == 0);
+
+		datum = index_getattr(tuple,
+							  key->sk_attno,
+							  tupdesc,
+							  &isNull);
+
+		if (key->sk_flags & SK_ISNULL)
+		{
+			/* Handle IS NULL/NOT NULL tests */
+			if (key->sk_flags & SK_SEARCHNULL)
+			{
+				if (isNull)
+					continue;	/* tuple satisfies this qual */
+			}
+			else
+			{
+				Assert(key->sk_flags & SK_SEARCHNOTNULL);
+				if (!isNull)
+					continue;	/* tuple satisfies this qual */
+			}
+
+			/*
+			 * Tuple fails this qual.  If it's a required qual for the current
+			 * scan direction, then we can conclude no further tuples will
+			 * pass, either.
+			 */
+			if ((key->sk_flags & SK_BT_REQFWD) &&
+				ScanDirectionIsForward(dir))
+				*continuescan = false;
+			else if ((key->sk_flags & SK_BT_REQBKWD) &&
+					 ScanDirectionIsBackward(dir))
+				*continuescan = false;
+
+			if ((key->sk_flags & SK_BT_REQSKIPFWD) &&
+				ScanDirectionIsForward(dir))
+				*prefixSkipIndex = key->sk_attno - 1;
+			else if ((key->sk_flags & SK_BT_REQSKIPBKWD) &&
+					 ScanDirectionIsBackward(dir))
+				*prefixSkipIndex = key->sk_attno - 1;
+
+			/*
+			 * In any case, this indextuple doesn't match the qual.
+			 */
+			return false;
+		}
+
+		if (isNull)
+		{
+			if (key->sk_flags & SK_BT_NULLS_FIRST)
+			{
+				/*
+				 * Since NULLs are sorted before non-NULLs, we know we have
+				 * reached the lower limit of the range of values for this
+				 * index attr.  On a backward scan, we can stop if this qual
+				 * is one of the "must match" subset.  We can stop regardless
+				 * of whether the qual is > or <, so long as it's required,
+				 * because it's not possible for any future tuples to pass. On
+				 * a forward scan, however, we must keep going, because we may
+				 * have initially positioned to the start of the index.
+				 */
+				if ((key->sk_flags & (SK_BT_REQFWD | SK_BT_REQBKWD)) &&
+					ScanDirectionIsBackward(dir))
+					*continuescan = false;
+
+				if ((key->sk_flags & (SK_BT_REQSKIPFWD | SK_BT_REQSKIPBKWD)) &&
+					ScanDirectionIsBackward(dir))
+					*prefixSkipIndex = key->sk_attno - 1;
+			}
+			else
+			{
+				/*
+				 * Since NULLs are sorted after non-NULLs, we know we have
+				 * reached the upper limit of the range of values for this
+				 * index attr.  On a forward scan, we can stop if this qual is
+				 * one of the "must match" subset.  We can stop regardless of
+				 * whether the qual is > or <, so long as it's required,
+				 * because it's not possible for any future tuples to pass. On
+				 * a backward scan, however, we must keep going, because we
+				 * may have initially positioned to the end of the index.
+				 */
+				if ((key->sk_flags & (SK_BT_REQFWD | SK_BT_REQBKWD)) &&
+					ScanDirectionIsForward(dir))
+					*continuescan = false;
+				if ((key->sk_flags & (SK_BT_REQSKIPFWD | SK_BT_REQSKIPBKWD)) &&
+					ScanDirectionIsBackward(dir))
+					*prefixSkipIndex = key->sk_attno - 1;
+			}
+
+			/*
+			 * In any case, this indextuple doesn't match the qual.
+			 */
+			return false;
+		}
+
+
+		/* Perform the test --- three-way comparison not bool operator */
+		cmpresult = DatumGetInt32(FunctionCall2Coll(&key->sk_func,
+													key->sk_collation,
+													datum,
+													key->sk_argument));
+
+		if (key->sk_flags & SK_BT_DESC)
+			INVERT_COMPARE_RESULT(cmpresult);
+
+		if (cmpresult != 0)
+		{
+			/*
+			 * Tuple fails this qual.  If it's a required qual for the current
+			 * scan direction, then we can conclude no further tuples will
+			 * pass, either.
+			 *
+			 * Note: because we stop the scan as soon as any required equality
+			 * qual fails, it is critical that equality quals be used for the
+			 * initial positioning in _bt_first() when they are available. See
+			 * comments in _bt_first().
+			 */
+			if ((key->sk_flags & SK_BT_REQFWD) &&
+				ScanDirectionIsForward(dir) && cmpresult > 0)
+				*continuescan = false;
+			else if ((key->sk_flags & SK_BT_REQBKWD) &&
+					 ScanDirectionIsBackward(dir) && cmpresult < 0)
+				*continuescan = false;
+
+			if ((key->sk_flags & SK_BT_REQSKIPFWD) &&
+				ScanDirectionIsForward(dir) && cmpresult > 0)
+				*prefixSkipIndex = key->sk_attno - 1;
+			else if ((key->sk_flags & SK_BT_REQSKIPBKWD) &&
+					 ScanDirectionIsBackward(dir) && cmpresult < 0)
+				*prefixSkipIndex = key->sk_attno - 1;
 
 			/*
 			 * In any case, this indextuple doesn't match the qual.

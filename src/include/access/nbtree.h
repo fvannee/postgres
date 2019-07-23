@@ -17,6 +17,7 @@
 #include "access/amapi.h"
 #include "access/itup.h"
 #include "access/sdir.h"
+#include "access/smode.h"
 #include "access/xlogreader.h"
 #include "catalog/pg_index.h"
 #include "lib/stringinfo.h"
@@ -625,6 +626,31 @@ typedef struct BTArrayKeyInfo
 	Datum	   *elem_values;	/* array of num_elems Datums */
 } BTArrayKeyInfo;
 
+typedef struct BTSkipCompareResult
+{
+	bool		equal;
+	int			prefixCmpResult, skCmpResult;
+	bool		prefixSkip, fullKeySkip;
+	int			prefixSkipIndex;
+} BTSkipCompareResult;
+
+typedef struct BTSkipData
+{
+	BTScanInsertData	skipScanKey;	/* used to control skipping */
+	BTScanInsertData	skipScanFwdKey;
+	ScanKeyData			fwdNotNullKeys[INDEX_MAX_KEYS];
+	BTScanInsertData	skipScanBwdKey;	/* used to control skipping */
+	ScanKeyData			bwdNotNullKeys[INDEX_MAX_KEYS];
+	int					prefix;
+	bool				extraConditionsPossibleFwd, extraConditionsPossibleBwd;
+	ScanDirection		curDir, overallDir;
+	ScanMode			curMode, overallMode;
+	BTSkipCompareResult	compareResult;
+	OffsetNumber		indexOffset;
+} BTSkipData;
+
+typedef BTSkipData *BTSkip;
+
 typedef struct BTScanOpaqueData
 {
 	/* these fields are set by _bt_preprocess_keys(): */
@@ -664,6 +690,7 @@ typedef struct BTScanOpaqueData
 
 	/* Work space for _bt_skip */
 	BTScanInsert	skipScanKey;	/* used to control skipping */
+	BTSkip			skipData;
 
 	/* keep these last in struct for efficiency */
 	BTScanPosData currPos;		/* current position data */
@@ -677,8 +704,10 @@ typedef BTScanOpaqueData *BTScanOpaque;
  * to use bits 16-31 (see skey.h).  The uppermost bits are copied from the
  * index's indoption[] array entry for the index attribute.
  */
-#define SK_BT_REQFWD	0x00010000	/* required to continue forward scan */
-#define SK_BT_REQBKWD	0x00020000	/* required to continue backward scan */
+#define SK_BT_REQFWD		0x00010000	/* required to continue forward scan */
+#define SK_BT_REQBKWD		0x00020000	/* required to continue backward scan */
+#define SK_BT_REQSKIPFWD	0x00040000	/* required to continue forward scan within current prefix */
+#define SK_BT_REQSKIPBKWD	0x00080000	/* required to continue backward scan within current prefix */
 #define SK_BT_INDOPTION_SHIFT  24	/* must clear the above bits */
 #define SK_BT_DESC			(INDOPTION_DESC << SK_BT_INDOPTION_SHIFT)
 #define SK_BT_NULLS_FIRST	(INDOPTION_NULLS_FIRST << SK_BT_INDOPTION_SHIFT)
@@ -704,7 +733,7 @@ extern bool btinsert(Relation rel, Datum *values, bool *isnull,
 extern IndexScanDesc btbeginscan(Relation rel, int nkeys, int norderbys);
 extern Size btestimateparallelscan(void);
 extern void btinitparallelscan(void *target);
-extern bool btgettuple(IndexScanDesc scan, ScanDirection dir);
+extern bool btgettuple(IndexScanDesc scan, ScanDirection dir, bool forceSkip);
 extern int64 btgetbitmap(IndexScanDesc scan, TIDBitmap *tbm);
 extern void btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 					 ScanKey orderbys, int norderbys);
@@ -778,15 +807,15 @@ extern Buffer _bt_moveright(Relation rel, BTScanInsert key, Buffer buf,
 extern OffsetNumber _bt_binsrch_insert(Relation rel, BTInsertState insertstate);
 extern int32 _bt_compare(Relation rel, BTScanInsert key, Page page, OffsetNumber offnum);
 extern bool _bt_first(IndexScanDesc scan, ScanDirection dir);
-extern bool _bt_next(IndexScanDesc scan, ScanDirection dir);
-extern bool _bt_skip(IndexScanDesc scan, ScanDirection dir,
-					 ScanDirection indexdir, bool start, int prefix);
+extern bool _bt_next(IndexScanDesc scan, ScanDirection dir, bool forceSkip);
 extern Buffer _bt_get_endpoint(Relation rel, uint32 level, bool rightmost,
 							   Snapshot snapshot);
 
 /*
  * prototypes for functions in nbtutils.c
  */
+extern bool _bt_checkkeys_threeway(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
+				ScanDirection dir, bool *continuescan, int *prefixSkipIndex);
 extern BTScanInsert _bt_mkscankey(Relation rel, IndexTuple itup);
 extern void _bt_freestack(BTStack stack);
 extern void _bt_preprocess_array_keys(IndexScanDesc scan);
@@ -796,7 +825,7 @@ extern void _bt_mark_array_keys(IndexScanDesc scan);
 extern void _bt_restore_array_keys(IndexScanDesc scan);
 extern void _bt_preprocess_keys(IndexScanDesc scan);
 extern bool _bt_checkkeys(IndexScanDesc scan, IndexTuple tuple,
-						  int tupnatts, ScanDirection dir, bool *continuescan);
+						  int tupnatts, ScanDirection dir, bool *continuescan, int *prefixSkipIndex);
 extern void _bt_killitems(IndexScanDesc scan);
 extern BTCycleId _bt_vacuum_cycleid(Relation rel);
 extern BTCycleId _bt_start_vacuum(Relation rel);
@@ -805,8 +834,7 @@ extern void _bt_end_vacuum_callback(int code, Datum arg);
 extern Size BTreeShmemSize(void);
 extern void BTreeShmemInit(void);
 extern bytea *btoptions(Datum reloptions, bool validate);
-extern bool btskip(IndexScanDesc scan, ScanDirection dir,
-				   ScanDirection indexdir, bool start, int prefix);
+extern bool btskip(IndexScanDesc scan, ScanDirection dir, int prefix, ScanMode mode);
 extern bool btproperty(Oid index_oid, int attno,
 					   IndexAMProperty prop, const char *propname,
 					   bool *res, bool *isnull);
