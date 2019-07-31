@@ -244,7 +244,7 @@ btgettuple(IndexScanDesc scan, ScanDirection dir)
 		 * _bt_first() to get the first item in the scan.
 		 */
 		if (!BTScanPosIsValid(so->currPos))
-			res = _bt_first(scan, dir);
+			res = _bt_first(scan, dir, false);
 		else
 		{
 			/*
@@ -309,7 +309,7 @@ btgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	do
 	{
 		/* Fetch the first page & tuple */
-		if (_bt_first(scan, ForwardScanDirection))
+		if (_bt_first(scan, ForwardScanDirection, true))
 		{
 			/* Save tuple ID, and continue scanning */
 			heapTid = &scan->xs_heaptid;

@@ -23,11 +23,24 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
+/*
+ * Enum used in _bt_readpage to determine how many tuples
+ * on the page need to be read.
+ * ReadPageModeFirst reads at least the first matching tuple,
+ * but possibly reads two as an optimization, in order to properly
+ * determine continuescan in _bt_readpage.
+ */
+typedef enum ReadPageMode
+{
+	ReadPageModeFirst, /* read only the first tuple */
+	ReadPageModeContinue, /* read the rest of the tuples on the page */
+	ReadPageModeAll /* read all tuples on the page */
+} ReadPageMode;
 
 static void _bt_drop_lock_and_maybe_pin(IndexScanDesc scan, BTScanPos sp);
 static OffsetNumber _bt_binsrch(Relation rel, BTScanInsert key, Buffer buf);
 static bool _bt_readpage(IndexScanDesc scan, ScanDirection dir,
-						 OffsetNumber offnum);
+						 OffsetNumber offnum, ReadPageMode readMode);
 static void _bt_saveitem(BTScanOpaque so, int itemIndex,
 						 OffsetNumber offnum, IndexTuple itup);
 static bool _bt_steppage(IndexScanDesc scan, ScanDirection dir);
@@ -37,6 +50,14 @@ static bool _bt_parallel_readpage(IndexScanDesc scan, BlockNumber blkno,
 static Buffer _bt_walk_left(Relation rel, Buffer buf, Snapshot snapshot);
 static bool _bt_endpoint(IndexScanDesc scan, ScanDirection dir);
 static inline void _bt_initialize_more_data(BTScanOpaque so, ScanDirection dir);
+static OffsetNumber _bt_find_offset_for_tid(
+		IndexScanDesc scan,
+		OffsetNumber offnum, ItemPointer tid);
+static OffsetNumber _bt_readnextpage_find_offset(IndexScanDesc scan,
+										BlockNumber blkno, ItemPointer tid);
+static OffsetNumber _bt_steppage_find_offset(IndexScanDesc scan, ItemPointer tid);
+static inline bool _bt_continue_scan_from_tid(
+		IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum, ItemPointer heapTid);
 
 
 /*
@@ -743,7 +764,7 @@ _bt_compare(Relation rel,
  * in locating the scan start position.
  */
 bool
-_bt_first(IndexScanDesc scan, ScanDirection dir)
+_bt_first(IndexScanDesc scan, ScanDirection dir, bool readFullPage)
 {
 	Relation	rel = scan->indexRelation;
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
@@ -1304,7 +1325,227 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 	/*
 	 * Now load data from the first page of the scan.
 	 */
-	if (!_bt_readpage(scan, dir, offnum))
+	if (!_bt_readpage(scan, dir, offnum, readFullPage ? ReadPageModeAll : ReadPageModeFirst))
+	{
+		/*
+		 * There's no actually-matching data on this page.  Try to advance to
+		 * the next page.  Return false if there's no matching data at all.
+		 */
+		LockBuffer(so->currPos.buf, BUFFER_LOCK_UNLOCK);
+		if (!_bt_steppage(scan, dir))
+			return false;
+	}
+	else
+	{
+		/* Drop the lock on the page. Do not drop the pin here because we could have
+		 * read just one item in ReadPageModeFirst mode so we may need to read it again.
+		 */
+		LockBuffer(so->currPos.buf, BUFFER_LOCK_UNLOCK);
+	}
+
+readcomplete:
+	/* OK, itemIndex says what to return */
+	currItem = &so->currPos.items[so->currPos.itemIndex];
+	scan->xs_heaptid = currItem->heapTid;
+	if (scan->xs_want_itup)
+		scan->xs_itup = (IndexTuple) (so->currTuples + currItem->tupleOffset);
+
+	return true;
+}
+
+/*
+ * Keep reading pages to the right of blkno until we find an item with heap tid as specified.
+ * It returns the offset number on the index page of the tuple with that tid.
+ * On entry, buffer is either pinned on unpinned, but not locked.
+ * On exit, buffer is pinnend and locked.
+ */
+OffsetNumber _bt_readnextpage_find_offset(IndexScanDesc scan, BlockNumber blkno, ItemPointer tid)
+{
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	Relation	rel;
+	Page		page;
+	BTPageOpaque opaque;
+
+	rel = scan->indexRelation;
+
+	if (BTScanPosIsPinned(so->currPos))
+		LockBuffer(so->currPos.buf, BT_READ);
+	else
+		so->currPos.buf = _bt_getbuf(rel, blkno, BT_READ);
+
+	page = BufferGetPage(so->currPos.buf);
+	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	/* We need the real page to the right here.
+	 * In case a split occurred, we can't follow the pre-stored pointer.
+	 */
+	blkno = opaque->btpo_next;
+	_bt_relbuf(rel, so->currPos.buf);
+
+	for (;;)
+	{
+		if (blkno == P_NONE)
+		{
+			return InvalidOffsetNumber;
+		}
+		/* check for interrupts while we're not holding any buffer lock */
+		CHECK_FOR_INTERRUPTS();
+
+		so->currPos.buf = _bt_getbuf(rel, blkno, BT_READ);
+
+		page = BufferGetPage(so->currPos.buf);
+		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+		/* check for deleted page */
+		if (!P_IGNORE(opaque))
+		{
+			/* reads current page for specified tid and return it if found  */
+			OffsetNumber offnum = _bt_find_offset_for_tid(scan, P_FIRSTDATAKEY(opaque), tid);
+			if (offnum != InvalidOffsetNumber)
+				return offnum;
+		}
+
+		blkno = opaque->btpo_next;
+		_bt_relbuf(rel, so->currPos.buf);
+	}
+	/* we didn't find it anywhere. this should never happen, but return InvalidOffSetNumber so
+	 * caller can raise an error if required.
+	 */
+	return InvalidOffsetNumber;
+}
+
+
+/*
+ * Steps pages to the right until it finds a tuple with specified heap tip.
+ * It returns the offset number on the index page of the tuple with that tid.
+ * This function just cleans up work on the current page and calls _bt_readnextpage_find_offset
+ * which does the rest of the work.
+ * On entry, buffer is either pinned or unpinned, but not locked.
+ * On exit, buffer is pinned and locked.
+ */
+OffsetNumber _bt_steppage_find_offset(IndexScanDesc scan, ItemPointer tid)
+{
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	BlockNumber blkno = InvalidBlockNumber;
+
+	Assert(BTScanPosIsValid(so->currPos));
+
+	/* Before leaving current page, deal with any killed items */
+	if (so->numKilled > 0)
+		_bt_killitems(scan);
+
+	/*
+	 * Before we modify currPos, make a copy of the page data if there was a
+	 * mark position that needs it.
+	 */
+	if (so->markItemIndex >= 0)
+	{
+		/* bump pin on current buffer for assignment to mark buffer */
+		if (BTScanPosIsPinned(so->currPos))
+			IncrBufferRefCount(so->currPos.buf);
+		memcpy(&so->markPos, &so->currPos,
+			   offsetof(BTScanPosData, items[1]) +
+			   so->currPos.lastItem * sizeof(BTScanPosItem));
+		if (so->markTuples)
+			memcpy(so->markTuples, so->currTuples,
+				   so->currPos.nextTupleOffset);
+		so->markPos.itemIndex = so->markItemIndex;
+		so->markItemIndex = -1;
+	}
+
+	blkno = so->currPos.currPage;
+	return _bt_readnextpage_find_offset(scan, blkno, tid);
+}
+
+/*
+ * Looks on the current page for an item with heap tid as specified.
+ * On entry, buffer is pinned and locked.
+ * On exit, buffer is still pinnend and locked.
+ */
+OffsetNumber _bt_find_offset_for_tid(IndexScanDesc scan, OffsetNumber offnum, ItemPointer tid)
+{
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	Page		page;
+	BTPageOpaque opaque;
+	OffsetNumber minoff;
+	OffsetNumber maxoff;
+	OffsetNumber curoff;
+
+	Assert(BufferIsValid(so->currPos.buf));
+
+	page = BufferGetPage(so->currPos.buf);
+	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+
+	minoff = P_FIRSTDATAKEY(opaque);
+	maxoff = PageGetMaxOffsetNumber(page);
+
+	/* Start searching at offnum, because this is the most likely place
+	 * where we will find the tuple.
+	 * However, it may have been moved due to insertions or page splits.
+	 * So if it's not at offnum, we need to look at the rest of the page.
+	 * An insertion is most likely, so first start looking at offsets
+	 * higher than offnum.
+	 */
+	curoff = Max(minoff, offnum);
+	while (curoff <= maxoff)
+	{
+		ItemId		iid = PageGetItemId(page, curoff);
+		IndexTuple	itup = (IndexTuple) PageGetItem(page, iid);
+
+		if (ItemPointerEquals(&itup->t_tid, tid))
+		{
+			return curoff;
+		}
+		curoff = OffsetNumberNext(curoff);
+	}
+	/*
+	 * It seems to be required to also scan back from offnum to minoff, but it is
+	 * unclear to me why this is necessary. Vacuum shouldn't be happening if we have
+	 * the buffer pinned continuously (which is the case since we explicitly assert this
+	 * in _bt_continue_scan_from_tid).
+	 */
+	curoff = OffsetNumberPrev(Min(maxoff, offnum));
+	while (curoff >= minoff)
+	{
+		ItemId		iid = PageGetItemId(page, curoff);
+		IndexTuple	itup = (IndexTuple) PageGetItem(page, iid);
+
+		if (ItemPointerEquals(&itup->t_tid, tid))
+		{
+			return curoff;
+		}
+		curoff = OffsetNumberPrev(curoff);
+	}
+	return InvalidOffsetNumber;
+}
+
+/*
+ * Continues scanning on the current page at the specified heapTid.
+ * The given offset number is given as a hint as to where this tid is most likely found in the index,
+ * although it could have been moved due to eg. insertions in the meantime.
+ * Buffer must be pinned but not locked.
+ * On exit, no lock is held while pin may or may not be released.
+ */
+bool _bt_continue_scan_from_tid(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum, ItemPointer heapTid)
+{
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	ReadPageMode readMode = ReadPageModeContinue;
+
+	Assert(BTScanPosIsPinned(so->currPos));
+	LockBuffer(so->currPos.buf, BT_READ);
+
+	offnum = _bt_find_offset_for_tid(scan, offnum, heapTid);
+	if (offnum == InvalidOffsetNumber)
+	{
+		LockBuffer(so->currPos.buf, BUFFER_LOCK_UNLOCK);
+		offnum = _bt_steppage_find_offset(scan, heapTid);
+		if (offnum == InvalidOffsetNumber)
+		{
+			elog(ERROR, "fell off the end of index while searching for heap tid \"%s\"",
+				 RelationGetRelationName(scan->indexRelation));
+		}
+		readMode = ReadPageModeAll;
+	}
+	offnum = ScanDirectionIsForward(dir) ? OffsetNumberNext(offnum) : OffsetNumberPrev(offnum);
+	if (!_bt_readpage(scan, dir, offnum, readMode))
 	{
 		/*
 		 * There's no actually-matching data on this page.  Try to advance to
@@ -1319,14 +1560,6 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 		/* Drop the lock, and maybe the pin, on the current page */
 		_bt_drop_lock_and_maybe_pin(scan, &so->currPos);
 	}
-
-readcomplete:
-	/* OK, itemIndex says what to return */
-	currItem = &so->currPos.items[so->currPos.itemIndex];
-	scan->xs_heaptid = currItem->heapTid;
-	if (scan->xs_want_itup)
-		scan->xs_itup = (IndexTuple) (so->currTuples + currItem->tupleOffset);
-
 	return true;
 }
 
@@ -1358,7 +1591,14 @@ _bt_next(IndexScanDesc scan, ScanDirection dir)
 	{
 		if (++so->currPos.itemIndex > so->currPos.lastItem)
 		{
-			if (!_bt_steppage(scan, dir))
+			if (so->currPos.moreRightOnCurPage)
+			{
+				OffsetNumber offnum = so->currPos.items[so->currPos.itemIndex - 1].indexOffset;
+				ItemPointer heapTid = &so->currPos.items[so->currPos.itemIndex - 1].heapTid;
+				if (!_bt_continue_scan_from_tid(scan, dir, offnum, heapTid))
+					return false;
+			}
+			else if (!_bt_steppage(scan, dir))
 				return false;
 		}
 	}
@@ -1366,7 +1606,14 @@ _bt_next(IndexScanDesc scan, ScanDirection dir)
 	{
 		if (--so->currPos.itemIndex < so->currPos.firstItem)
 		{
-			if (!_bt_steppage(scan, dir))
+			if (so->currPos.moreLeftOnCurPage)
+			{
+				OffsetNumber offnum = so->currPos.items[so->currPos.itemIndex + 1].indexOffset;
+				ItemPointer heapTid = &so->currPos.items[so->currPos.itemIndex + 1].heapTid;
+				if (!_bt_continue_scan_from_tid(scan, dir, offnum, heapTid))
+					return false;
+			}
+			else if (!_bt_steppage(scan, dir))
 				return false;
 		}
 	}
@@ -1399,8 +1646,9 @@ _bt_next(IndexScanDesc scan, ScanDirection dir)
  *
  * Returns true if any matching items found on the page, false if none.
  */
+
 static bool
-_bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum)
+_bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum, ReadPageMode readMode)
 {
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	Page		page;
@@ -1408,6 +1656,7 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum)
 	OffsetNumber minoff;
 	OffsetNumber maxoff;
 	int			itemIndex;
+	int			startItemIndex;
 	bool		continuescan;
 	int			indnatts;
 
@@ -1434,28 +1683,38 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum)
 	minoff = P_FIRSTDATAKEY(opaque);
 	maxoff = PageGetMaxOffsetNumber(page);
 
-	/*
-	 * We note the buffer's block number so that we can release the pin later.
-	 * This allows us to re-read the buffer if it is needed again for hinting.
-	 */
-	so->currPos.currPage = BufferGetBlockNumber(so->currPos.buf);
+	if (readMode != ReadPageModeContinue)
+	{
+		/*
+		 * We note the buffer's block number so that we can release the pin later.
+		 * This allows us to re-read the buffer if it is needed again for hinting.
+		 */
+		so->currPos.currPage = BufferGetBlockNumber(so->currPos.buf);
 
-	/*
-	 * We save the LSN of the page as we read it, so that we know whether it
-	 * safe to apply LP_DEAD hints to the page later.  This allows us to drop
-	 * the pin for MVCC scans, which allows vacuum to avoid blocking.
-	 */
-	so->currPos.lsn = BufferGetLSNAtomic(so->currPos.buf);
+		/*
+		 * We save the LSN of the page as we read it, so that we know whether it
+		 * safe to apply LP_DEAD hints to the page later.  This allows us to drop
+		 * the pin for MVCC scans, which allows vacuum to avoid blocking.
+		 */
+		so->currPos.lsn = BufferGetLSNAtomic(so->currPos.buf);
 
-	/*
-	 * we must save the page's right-link while scanning it; this tells us
-	 * where to step right to after we're done with these items.  There is no
-	 * corresponding need for the left-link, since splits always go right.
-	 */
-	so->currPos.nextPage = opaque->btpo_next;
+		/*
+		 * we must save the page's right-link while scanning it; this tells us
+		 * where to step right to after we're done with these items.  There is no
+		 * corresponding need for the left-link, since splits always go right.
+		 */
+		so->currPos.nextPage = opaque->btpo_next;
 
-	/* initialize tuple workspace to empty */
-	so->currPos.nextTupleOffset = 0;
+		/* initialize tuple workspace to empty */
+		so->currPos.nextTupleOffset = 0;
+	}
+	else
+	{
+		/* we must save the next page link, because it may have changed while we
+		 * didn't hold the lock
+		 */
+		so->currPos.nextPage = opaque->btpo_next;
+	}
 
 	/*
 	 * Now that the current page has been made consistent, the macro should be
@@ -1465,8 +1724,15 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum)
 
 	if (ScanDirectionIsForward(dir))
 	{
+		so->currPos.moreLeftOnCurPage = false;
+		so->currPos.moreRightOnCurPage = (readMode == ReadPageModeFirst);
+
 		/* load items[] in ascending order */
-		itemIndex = 0;
+
+		if (readMode != ReadPageModeContinue)
+			itemIndex = startItemIndex = 0;
+		else
+			itemIndex = startItemIndex = so->currPos.itemIndex;
 
 		offnum = Max(offnum, minoff);
 
@@ -1492,6 +1758,29 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum)
 				/* tuple passes all scan key conditions, so remember it */
 				_bt_saveitem(so, itemIndex, offnum, itup);
 				itemIndex++;
+
+				if (readMode == ReadPageModeFirst)
+				{
+					/* we do compare one item further if possible
+					 * in order to check if we can set continuescan to false
+					 * this is useful for a PK search where the next item
+					 * will never match
+					 */
+					offnum = OffsetNumberNext(offnum);
+					if (offnum <= maxoff)
+					{
+						iid = PageGetItemId(page, offnum);
+						itup = (IndexTuple) PageGetItem(page, iid);
+
+						if (_bt_checkkeys(scan, itup, indnatts, dir, &continuescan) && (!scan->ignore_killed_tuples || !ItemIdIsDead(iid)))
+						{
+							_bt_saveitem(so, itemIndex, offnum, itup);
+							itemIndex++;
+						}
+						offnum = OffsetNumberNext(offnum);
+					}
+					break;
+				}
 			}
 			/* When !continuescan, there can't be any more matches, so stop */
 			if (!continuescan)
@@ -1511,7 +1800,7 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum)
 		 * only appear on non-pivot tuples on the right sibling page are
 		 * common.
 		 */
-		if (continuescan && !P_RIGHTMOST(opaque))
+		if (continuescan && readMode != ReadPageModeFirst && !P_RIGHTMOST(opaque))
 		{
 			ItemId		iid = PageGetItemId(page, P_HIKEY);
 			IndexTuple	itup = (IndexTuple) PageGetItem(page, iid);
@@ -1521,18 +1810,31 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum)
 			_bt_checkkeys(scan, itup, truncatt, dir, &continuescan);
 		}
 
+		if (offnum > maxoff)
+			so->currPos.moreRightOnCurPage = false;
 		if (!continuescan)
+		{
 			so->currPos.moreRight = false;
+			so->currPos.moreRightOnCurPage = false;
+		}
 
 		Assert(itemIndex <= MaxIndexTuplesPerPage);
 		so->currPos.firstItem = 0;
 		so->currPos.lastItem = itemIndex - 1;
-		so->currPos.itemIndex = 0;
+		so->currPos.itemIndex = startItemIndex;
+
+		return (startItemIndex <= so->currPos.lastItem);
 	}
 	else
 	{
+		so->currPos.moreLeftOnCurPage = (readMode == ReadPageModeFirst);
+		so->currPos.moreRightOnCurPage = false;
+
 		/* load items[] in descending order */
-		itemIndex = MaxIndexTuplesPerPage;
+		if (readMode != ReadPageModeContinue)
+			itemIndex = startItemIndex = MaxIndexTuplesPerPage;
+		else
+			itemIndex = startItemIndex = so->currPos.itemIndex + 1;
 
 		offnum = Min(offnum, maxoff);
 
@@ -1576,24 +1878,53 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum)
 				/* tuple passes all scan key conditions, so remember it */
 				itemIndex--;
 				_bt_saveitem(so, itemIndex, offnum, itup);
+
+				if (readMode == ReadPageModeFirst)
+				{
+					/* we do compare one item further if possible
+					 * in order to check if we can set continuescan to false
+					 * this is useful for a PK search where the next item
+					 * will never match
+					 */
+					offnum = OffsetNumberPrev(offnum);
+					if (offnum >= minoff)
+					{
+						iid = PageGetItemId(page, offnum);
+						itup = (IndexTuple) PageGetItem(page, iid);
+
+						if (_bt_checkkeys(scan, itup, indnatts, dir, &continuescan) && (!scan->ignore_killed_tuples || !ItemIdIsDead(iid)))
+						{
+							itemIndex--;
+							_bt_saveitem(so, itemIndex, offnum, itup);
+						}
+						offnum = OffsetNumberPrev(offnum);
+					}
+					break;
+				}
 			}
 			if (!continuescan)
 			{
 				/* there can't be any more matches, so stop */
-				so->currPos.moreLeft = false;
 				break;
 			}
 
 			offnum = OffsetNumberPrev(offnum);
 		}
+		if (!continuescan)
+		{
+			so->currPos.moreLeft = false;
+			so->currPos.moreLeftOnCurPage = false;
+		}
+		if (offnum < minoff)
+			so->currPos.moreLeftOnCurPage = false;
 
 		Assert(itemIndex >= 0);
 		so->currPos.firstItem = itemIndex;
 		so->currPos.lastItem = MaxIndexTuplesPerPage - 1;
-		so->currPos.itemIndex = MaxIndexTuplesPerPage - 1;
-	}
+		so->currPos.itemIndex = startItemIndex - 1;
 
-	return (so->currPos.firstItem <= so->currPos.lastItem);
+		return (so->currPos.firstItem <= startItemIndex - 1);
+	}
 }
 
 /* Save an index item into so->currPos.items[itemIndex] */
@@ -1771,7 +2102,7 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno, ScanDirection dir)
 				PredicateLockPage(rel, blkno, scan->xs_snapshot);
 				/* see if there are any matches on this page */
 				/* note that this will clear moreRight if we can stop */
-				if (_bt_readpage(scan, dir, P_FIRSTDATAKEY(opaque)))
+				if (_bt_readpage(scan, dir, P_FIRSTDATAKEY(opaque), ReadPageModeAll))
 					break;
 			}
 			else if (scan->parallel_scan != NULL)
@@ -1873,7 +2204,7 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno, ScanDirection dir)
 				PredicateLockPage(rel, BufferGetBlockNumber(so->currPos.buf), scan->xs_snapshot);
 				/* see if there are any matches on this page */
 				/* note that this will clear moreLeft if we can stop */
-				if (_bt_readpage(scan, dir, PageGetMaxOffsetNumber(page)))
+				if (_bt_readpage(scan, dir, PageGetMaxOffsetNumber(page), ReadPageModeAll))
 					break;
 			}
 			else if (scan->parallel_scan != NULL)
@@ -2205,7 +2536,7 @@ _bt_endpoint(IndexScanDesc scan, ScanDirection dir)
 	/*
 	 * Now load data from the first page of the scan.
 	 */
-	if (!_bt_readpage(scan, dir, start))
+	if (!_bt_readpage(scan, dir, start, ReadPageModeAll))
 	{
 		/*
 		 * There's no actually-matching data on this page.  Try to advance to

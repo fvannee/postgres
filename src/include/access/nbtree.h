@@ -554,6 +554,14 @@ typedef struct BTScanPosData
 	BlockNumber nextPage;		/* page's right link when we scanned it */
 
 	/*
+	 * These are used when _bt_first is told not to scan the full page
+	 * but only the initial matching tuple. They indicate whether or not
+	 * there is more data to be scanned on the current page.
+	 */
+	bool		moreLeftOnCurPage;
+	bool		moreRightOnCurPage;
+
+	/*
 	 * moreLeft and moreRight track whether we think there may be matching
 	 * index entries to the left and right of the current page, respectively.
 	 * We can clear the appropriate one of these flags when _bt_checkkeys()
@@ -775,7 +783,7 @@ extern Buffer _bt_moveright(Relation rel, BTScanInsert key, Buffer buf,
 							bool forupdate, BTStack stack, int access, Snapshot snapshot);
 extern OffsetNumber _bt_binsrch_insert(Relation rel, BTInsertState insertstate);
 extern int32 _bt_compare(Relation rel, BTScanInsert key, Page page, OffsetNumber offnum);
-extern bool _bt_first(IndexScanDesc scan, ScanDirection dir);
+extern bool _bt_first(IndexScanDesc scan, ScanDirection dir, bool readFullPage);
 extern bool _bt_next(IndexScanDesc scan, ScanDirection dir);
 extern Buffer _bt_get_endpoint(Relation rel, uint32 level, bool rightmost,
 							   Snapshot snapshot);
