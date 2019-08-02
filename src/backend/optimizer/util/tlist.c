@@ -427,7 +427,6 @@ get_sortgrouplist_exprs(List *sgClauses, List *targetList)
 	return result;
 }
 
-
 /*****************************************************************************
  *		Functions to extract data from a list of SortGroupClauses
  *

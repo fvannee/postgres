@@ -705,6 +705,11 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 		path->path.parallel_aware = true;
 	}
 
+	/* Consider cost based on unique key */
+	if (path->path.uniquekeys)
+	{
+	}
+
 	/*
 	 * Now interpolate based on estimated index order correlation to get total
 	 * disk I/O cost for main table accesses.
