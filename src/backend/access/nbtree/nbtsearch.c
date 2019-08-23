@@ -1510,6 +1510,8 @@ OffsetNumber _bt_find_offset_for_tid(IndexScanDesc scan, OffsetNumber offnum, It
 
 		if (ItemPointerEquals(&itup->t_tid, tid))
 		{
+			elog(WARNING, "%d", so->currPos.buf - 1);
+			Assert(false);
 			return curoff;
 		}
 		curoff = OffsetNumberPrev(curoff);

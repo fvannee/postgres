@@ -30,6 +30,8 @@
  */
 #include "postgres.h"
 
+#include <execinfo.h>
+
 #include <sys/file.h>
 #include <unistd.h>
 
@@ -1553,6 +1555,14 @@ ReleaseAndReadBuffer(Buffer buffer,
 	return ReadBuffer(relation, blockNum);
 }
 
+
+void* test_buffers[10000][10];
+int test_levels[10000];
+int test_buffers_idx[10000];
+int test_buffers_lvl[10000];
+int test_curindex = 0;
+
+
 /*
  * PinBuffer -- make buffer unavailable for replacement.
  *
@@ -1626,6 +1636,7 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 				break;
 			}
 		}
+
 	}
 	else
 	{
@@ -1634,6 +1645,12 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 	}
 
 	ref->refcount++;
+
+	test_levels[test_curindex] = backtrace(test_buffers[test_curindex], 10);
+	test_buffers_idx[test_curindex] = buf->buf_id;
+	test_buffers_lvl[test_curindex] = ref->refcount;
+	test_curindex = (test_curindex + 1) % 10000;
+
 	Assert(ref->refcount > 0);
 	ResourceOwnerRememberBuffer(CurrentResourceOwner, b);
 	return result;
@@ -1698,6 +1715,7 @@ PinBuffer_Locked(BufferDesc *buf)
  * Most but not all callers want CurrentResourceOwner to be adjusted.
  * Those that don't should pass fixOwner = false.
  */
+
 static void
 UnpinBuffer(BufferDesc *buf, bool fixOwner)
 {
@@ -1713,10 +1731,24 @@ UnpinBuffer(BufferDesc *buf, bool fixOwner)
 
 	Assert(ref->refcount > 0);
 	ref->refcount--;
+	test_levels[test_curindex] = backtrace(test_buffers[test_curindex], 10);
+	test_buffers_idx[test_curindex] = buf->buf_id;
+	test_buffers_lvl[test_curindex] = ref->refcount;
+	test_curindex = (test_curindex + 1) % 10000;
 	if (ref->refcount == 0)
 	{
 		uint32		buf_state;
 		uint32		old_buf_state;
+
+//		void *buffers[10];
+
+//		char** names = backtrace_symbols(buffers, levels);
+
+//		for (int i = 0; i < levels; i++)
+//		{
+//			elog(LOG_SERVER_ONLY, "Release ID: %d - %s", buf->buf_id, names[i]);
+//		}
+//		free(names);
 
 		/* I'd better not still hold any locks on the buffer */
 		Assert(!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)));
