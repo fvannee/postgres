@@ -381,7 +381,6 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 	 */
 	so->currTuples = so->markTuples = NULL;
 
-	so->skipScanKey = NULL;
 	so->skipData = NULL;
 
 	scan->xs_itupdesc = RelationGetDescr(rel);
@@ -452,7 +451,7 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 }
 
 /*
- * btskip() -- skip to the beginning of the next key prefix
+ * btskip() -- initialize skip structure
  */
 bool
 btskip(IndexScanDesc scan, ScanDirection direction, int prefix, ScanMode mode)
@@ -465,7 +464,8 @@ btskip(IndexScanDesc scan, ScanDirection direction, int prefix, ScanMode mode)
 	so->skipData->curDir = so->skipData->overallDir = direction;
 	so->skipData->prefix = prefix;
 	so->skipData->overallMode = so->skipData->curMode = mode;
-	so->skipData->skipScanKey.keysz = so->skipData->skipScanFwdKey.keysz = so->skipData->skipScanBwdKey.keysz = 0;
+	so->skipData->skipScanKey.keysz = so->skipData->fwdScanKey.keysz = so->skipData->bwdScanKey.keysz = 0;
+	so->skipData->currentTupleKey.keysz = 0;
 	so->skipData->compareResult.skCmpResult = -2;
 	so->skipData->compareResult.prefixCmpResult = -2;
 	return true;

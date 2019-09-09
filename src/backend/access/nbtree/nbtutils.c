@@ -20,6 +20,7 @@
 #include "access/nbtree.h"
 #include "access/reloptions.h"
 #include "access/relscan.h"
+#include "catalog/catalog.h"
 #include "commands/progress.h"
 #include "miscadmin.h"
 #include "utils/array.h"
@@ -82,9 +83,8 @@ static int	_bt_keep_natts(Relation rel, IndexTuple lastleft,
  *		build callers to avoid accessing the non-existent metapage.
  */
 BTScanInsert
-_bt_mkscankey(Relation rel, IndexTuple itup)
+_bt_mkscankey(Relation rel, IndexTuple itup, BTScanInsert key)
 {
-	BTScanInsert key;
 	ScanKey		skey;
 	TupleDesc	itupdesc;
 	int			indnkeyatts;
@@ -104,8 +104,11 @@ _bt_mkscankey(Relation rel, IndexTuple itup)
 	 * Truncated attributes and non-key attributes are omitted from the final
 	 * scan key.
 	 */
-	key = palloc(offsetof(BTScanInsertData, scankeys) +
-				 sizeof(ScanKeyData) * indnkeyatts);
+	if (key == NULL)
+	{
+		key = palloc(offsetof(BTScanInsertData, scankeys) +
+					 sizeof(ScanKeyData) * indnkeyatts);
+	}
 	key->heapkeyspace = itup == NULL || _bt_heapkeyspace(rel);
 	key->anynullkeys = false;	/* initial assumption */
 	key->nextkey = false;
@@ -1585,9 +1588,9 @@ _bt_checkkeys_threeway(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
 	tupdesc = RelationGetDescr(scan->indexRelation);
 	so = (BTScanOpaque) scan->opaque;
 	if (ScanDirectionIsForward(dir))
-		keys = &so->skipData->skipScanBwdKey;
+		keys = &so->skipData->bwdScanKey;
 	else
-		keys = &so->skipData->skipScanFwdKey;
+		keys = &so->skipData->fwdScanKey;
 
 	keysz = keys->keysz;
 
@@ -2819,4 +2822,544 @@ _bt_check_third_page(Relation rel, Relation heap, bool needheaptidspace,
 					 "Consider a function index of an MD5 hash of the value, "
 					 "or use full text indexing."),
 			 errtableconstraint(heap, RelationGetRelationName(rel))));
+}
+
+void _bt_set_bsearch_flags(StrategyNumber stratTotal, ScanDirection dir, bool* nextkey, bool* goback)
+{
+	/*----------
+	 * Examine the selected initial-positioning strategy to determine exactly
+	 * where we need to start the scan, and set flag variables to control the
+	 * code below.
+	 *
+	 * If nextkey = false, _bt_search and _bt_binsrch will locate the first
+	 * item >= scan key.  If nextkey = true, they will locate the first
+	 * item > scan key.
+	 *
+	 * If goback = true, we will then step back one item, while if
+	 * goback = false, we will start the scan on the located item.
+	 *----------
+	 */
+	switch (stratTotal)
+	{
+		case BTLessStrategyNumber:
+
+			/*
+			 * Find first item >= scankey, then back up one to arrive at last
+			 * item < scankey.  (Note: this positioning strategy is only used
+			 * for a backward scan, so that is always the correct starting
+			 * position.)
+			 */
+			*nextkey = false;
+			*goback = true;
+			break;
+
+		case BTLessEqualStrategyNumber:
+
+			/*
+			 * Find first item > scankey, then back up one to arrive at last
+			 * item <= scankey.  (Note: this positioning strategy is only used
+			 * for a backward scan, so that is always the correct starting
+			 * position.)
+			 */
+			*nextkey = true;
+			*goback = true;
+			break;
+
+		case BTEqualStrategyNumber:
+
+			/*
+			 * If a backward scan was specified, need to start with last equal
+			 * item not first one.
+			 */
+			if (ScanDirectionIsBackward(dir))
+			{
+				/*
+				 * This is the same as the <= strategy.  We will check at the
+				 * end whether the found item is actually =.
+				 */
+				*nextkey = true;
+				*goback = true;
+			}
+			else
+			{
+				/*
+				 * This is the same as the >= strategy.  We will check at the
+				 * end whether the found item is actually =.
+				 */
+				*nextkey = false;
+				*goback = false;
+			}
+			break;
+
+		case BTGreaterEqualStrategyNumber:
+
+			/*
+			 * Find first item >= scankey.  (This is only used for forward
+			 * scans.)
+			 */
+			*nextkey = false;
+			*goback = false;
+			break;
+
+		case BTGreaterStrategyNumber:
+
+			/*
+			 * Find first item > scankey.  (This is only used for forward
+			 * scans.)
+			 */
+			*nextkey = true;
+			*goback = false;
+			break;
+
+		default:
+			/* can't get here, but keep compiler quiet */
+			elog(ERROR, "unrecognized strat_total: %d", (int) stratTotal);
+	}
+}
+
+bool _bt_create_insertion_scan_key(Relation	rel, ScanDirection dir, ScanKey* startKeys, int keysCount, BTScanInsert inskey, StrategyNumber* stratTotal,  bool* goback)
+{
+	int i;
+	bool nextkey;
+
+	/*
+	 * We want to start the scan somewhere within the index.  Set up an
+	 * insertion scankey we can use to search for the boundary point we
+	 * identified above.  The insertion scankey is built using the keys
+	 * identified by startKeys[].  (Remaining insertion scankey fields are
+	 * initialized after initial-positioning strategy is finalized.)
+	 */
+	Assert(keysCount <= INDEX_MAX_KEYS);
+	for (i = 0; i < keysCount; i++)
+	{
+		ScanKey		cur = startKeys[i];
+
+		if (cur == NULL)
+		{
+			inskey->scankeys[i].sk_attno = 0;
+			continue;
+		}
+
+		Assert(cur->sk_attno == i + 1);
+
+		if (cur->sk_flags & SK_ROW_HEADER)
+		{
+			/*
+			 * Row comparison header: look to the first row member instead.
+			 *
+			 * The member scankeys are already in insertion format (ie, they
+			 * have sk_func = 3-way-comparison function), but we have to watch
+			 * out for nulls, which _bt_preprocess_keys didn't check. A null
+			 * in the first row member makes the condition unmatchable, just
+			 * like qual_ok = false.
+			 */
+			ScanKey		subkey = (ScanKey) DatumGetPointer(cur->sk_argument);
+
+			Assert(subkey->sk_flags & SK_ROW_MEMBER);
+			if (subkey->sk_flags & SK_ISNULL)
+			{
+				return false;
+			}
+			memcpy(inskey->scankeys + i, subkey, sizeof(ScanKeyData));
+
+			/*
+			 * If the row comparison is the last positioning key we accepted,
+			 * try to add additional keys from the lower-order row members.
+			 * (If we accepted independent conditions on additional index
+			 * columns, we use those instead --- doesn't seem worth trying to
+			 * determine which is more restrictive.)  Note that this is OK
+			 * even if the row comparison is of ">" or "<" type, because the
+			 * condition applied to all but the last row member is effectively
+			 * ">=" or "<=", and so the extra keys don't break the positioning
+			 * scheme.  But, by the same token, if we aren't able to use all
+			 * the row members, then the part of the row comparison that we
+			 * did use has to be treated as just a ">=" or "<=" condition, and
+			 * so we'd better adjust strat_total accordingly.
+			 */
+			if (i == keysCount - 1)
+			{
+				bool		used_all_subkeys = false;
+
+				Assert(!(subkey->sk_flags & SK_ROW_END));
+				for (;;)
+				{
+					subkey++;
+					Assert(subkey->sk_flags & SK_ROW_MEMBER);
+					if (subkey->sk_attno != keysCount + 1)
+						break;	/* out-of-sequence, can't use it */
+					if (subkey->sk_strategy != cur->sk_strategy)
+						break;	/* wrong direction, can't use it */
+					if (subkey->sk_flags & SK_ISNULL)
+						break;	/* can't use null keys */
+					Assert(keysCount < INDEX_MAX_KEYS);
+					memcpy(inskey->scankeys + keysCount, subkey,
+						   sizeof(ScanKeyData));
+					keysCount++;
+					if (subkey->sk_flags & SK_ROW_END)
+					{
+						used_all_subkeys = true;
+						break;
+					}
+				}
+				if (!used_all_subkeys)
+				{
+					switch (*stratTotal)
+					{
+						case BTLessStrategyNumber:
+							*stratTotal = BTLessEqualStrategyNumber;
+							break;
+						case BTGreaterStrategyNumber:
+							*stratTotal = BTGreaterEqualStrategyNumber;
+							break;
+					}
+				}
+				break;			/* done with outer loop */
+			}
+		}
+		else
+		{
+			/*
+			 * Ordinary comparison key.  Transform the search-style scan key
+			 * to an insertion scan key by replacing the sk_func with the
+			 * appropriate btree comparison function.
+			 *
+			 * If scankey operator is not a cross-type comparison, we can use
+			 * the cached comparison function; otherwise gotta look it up in
+			 * the catalogs.  (That can't lead to infinite recursion, since no
+			 * indexscan initiated by syscache lookup will use cross-data-type
+			 * operators.)
+			 *
+			 * We support the convention that sk_subtype == InvalidOid means
+			 * the opclass input type; this is a hack to simplify life for
+			 * ScanKeyInit().
+			 */
+			if (cur->sk_subtype == rel->rd_opcintype[i] ||
+				cur->sk_subtype == InvalidOid)
+			{
+				FmgrInfo   *procinfo;
+
+				procinfo = index_getprocinfo(rel, cur->sk_attno, BTORDER_PROC);
+				ScanKeyEntryInitializeWithInfo(inskey->scankeys + i,
+											   cur->sk_flags,
+											   cur->sk_attno,
+											   cur->sk_strategy,
+											   cur->sk_subtype,
+											   cur->sk_collation,
+											   procinfo,
+											   cur->sk_argument);
+			}
+			else
+			{
+				RegProcedure cmp_proc;
+
+				cmp_proc = get_opfamily_proc(rel->rd_opfamily[i],
+											 rel->rd_opcintype[i],
+											 cur->sk_subtype,
+											 BTORDER_PROC);
+				if (!RegProcedureIsValid(cmp_proc))
+					elog(ERROR, "missing support function %d(%u,%u) for attribute %d of index \"%s\"",
+						 BTORDER_PROC, rel->rd_opcintype[i], cur->sk_subtype,
+						 cur->sk_attno, RelationGetRelationName(rel));
+				ScanKeyEntryInitialize(inskey->scankeys + i,
+									   cur->sk_flags,
+									   cur->sk_attno,
+									   cur->sk_strategy,
+									   cur->sk_subtype,
+									   cur->sk_collation,
+									   cmp_proc,
+									   cur->sk_argument);
+			}
+		}
+	}
+
+	_bt_set_bsearch_flags(*stratTotal, dir, &nextkey, goback);
+
+	/* Initialize remaining insertion scan key fields */
+	inskey->heapkeyspace = _bt_heapkeyspace(rel);
+	inskey->anynullkeys = false; /* unused */
+	inskey->nextkey = nextkey;
+	inskey->pivotsearch = false;
+	inskey->scantid = NULL;
+	inskey->keysz = keysCount;
+
+	return true;
+}
+
+/*----------
+ * Examine the scan keys to discover where we need to start the scan.
+ *
+ * We want to identify the keys that can be used as starting boundaries;
+ * these are =, >, or >= keys for a forward scan or =, <, <= keys for
+ * a backwards scan.  We can use keys for multiple attributes so long as
+ * the prior attributes had only =, >= (resp. =, <=) keys.  Once we accept
+ * a > or < boundary or find an attribute with no boundary (which can be
+ * thought of as the same as "> -infinity"), we can't use keys for any
+ * attributes to its right, because it would break our simplistic notion
+ * of what initial positioning strategy to use.
+ *
+ * When the scan keys include cross-type operators, _bt_preprocess_keys
+ * may not be able to eliminate redundant keys; in such cases we will
+ * arbitrarily pick a usable one for each attribute.  This is correct
+ * but possibly not optimal behavior.  (For example, with keys like
+ * "x >= 4 AND x >= 5" we would elect to scan starting at x=4 when
+ * x=5 would be more efficient.)  Since the situation only arises given
+ * a poorly-worded query plus an incomplete opfamily, live with it.
+ *
+ * When both equality and inequality keys appear for a single attribute
+ * (again, only possible when cross-type operators appear), we *must*
+ * select one of the equality keys for the starting point, because
+ * _bt_checkkeys() will stop the scan as soon as an equality qual fails.
+ * For example, if we have keys like "x >= 4 AND x = 10" and we elect to
+ * start at x=4, we will fail and stop before reaching x=10.  If multiple
+ * equality quals survive preprocessing, however, it doesn't matter which
+ * one we use --- by definition, they are either redundant or
+ * contradictory.
+ *
+ * Any regular (not SK_SEARCHNULL) key implies a NOT NULL qualifier.
+ * If the index stores nulls at the end of the index we'll be starting
+ * from, and we have no boundary key for the column (which means the key
+ * we deduced NOT NULL from is an inequality key that constrains the other
+ * end of the index), then we cons up an explicit SK_SEARCHNOTNULL key to
+ * use as a boundary key.  If we didn't do this, we might find ourselves
+ * traversing a lot of null entries at the start of the scan.
+ *
+ * In this loop, row-comparison keys are treated the same as keys on their
+ * first (leftmost) columns.  We'll add on lower-order columns of the row
+ * comparison below, if possible.
+ *
+ * The selected scan keys (at most one per index column) are remembered by
+ * storing their addresses into the local startKeys[] array.
+ *----------
+ */
+int _bt_choose_scan_keys(ScanKey scanKeys, int numberOfKeys, ScanDirection dir, ScanKey* startKeys, ScanKeyData* notnullkeys, StrategyNumber* stratTotal, int prefix)
+{
+	StrategyNumber strat;
+	int			keysCount = 0;
+	int			i;
+
+	*stratTotal = BTEqualStrategyNumber;
+	if (numberOfKeys > 0 || prefix > 0)
+	{
+		AttrNumber	curattr;
+		ScanKey		chosen;
+		ScanKey		impliesNN;
+		ScanKey		cur;
+
+		/*
+		 * chosen is the so-far-chosen key for the current attribute, if any.
+		 * We don't cast the decision in stone until we reach keys for the
+		 * next attribute.
+		 */
+		curattr = 1;
+		chosen = NULL;
+		/* Also remember any scankey that implies a NOT NULL constraint */
+		impliesNN = NULL;
+
+		/*
+		 * Loop iterates from 0 to numberOfKeys inclusive; we use the last
+		 * pass to handle after-last-key processing.  Actual exit from the
+		 * loop is at one of the "break" statements below.
+		 */
+		for (cur = scanKeys, i = 0;; cur++, i++)
+		{
+			if (i >= numberOfKeys || cur->sk_attno != curattr)
+			{
+				/*
+				 * Done looking at keys for curattr.  If we didn't find a
+				 * usable boundary key, see if we can deduce a NOT NULL key.
+				 */
+				if (chosen == NULL && impliesNN != NULL &&
+					((impliesNN->sk_flags & SK_BT_NULLS_FIRST) ?
+					 ScanDirectionIsForward(dir) :
+					 ScanDirectionIsBackward(dir)))
+				{
+					/* Yes, so build the key in notnullkeys[keysCount] */
+					chosen = &notnullkeys[keysCount];
+					ScanKeyEntryInitialize(chosen,
+										   (SK_SEARCHNOTNULL | SK_ISNULL |
+											(impliesNN->sk_flags &
+											 (SK_BT_DESC | SK_BT_NULLS_FIRST))),
+										   curattr,
+										   ((impliesNN->sk_flags & SK_BT_NULLS_FIRST) ?
+											BTGreaterStrategyNumber :
+											BTLessStrategyNumber),
+										   InvalidOid,
+										   InvalidOid,
+										   InvalidOid,
+										   (Datum) 0);
+				}
+
+				/*
+				 * If we still didn't find a usable boundary key, quit; else
+				 * save the boundary key pointer in startKeys.
+				 */
+				if (chosen == NULL && curattr > prefix)
+					break;
+				startKeys[keysCount++] = chosen;
+
+				/*
+				 * Adjust strat_total, and quit if we have stored a > or <
+				 * key.
+				 */
+				if (chosen != NULL && curattr > prefix)
+				{
+					strat = chosen->sk_strategy;
+					if (strat != BTEqualStrategyNumber)
+					{
+						*stratTotal = strat;
+						if (strat == BTGreaterStrategyNumber ||
+							strat == BTLessStrategyNumber)
+							break;
+					}
+				}
+
+				/*
+				 * Done if that was the last attribute, or if next key is not
+				 * in sequence (implying no boundary key is available for the
+				 * next attribute).
+				 */
+				if (i >= numberOfKeys)
+				{
+					curattr++;
+					while(curattr <= prefix)
+					{
+						startKeys[keysCount++] = NULL;
+						curattr++;
+					}
+					break;
+				}
+				else if (cur->sk_attno != curattr + 1)
+				{
+					curattr++;
+					while(curattr < cur->sk_attno && curattr <= prefix)
+					{
+						startKeys[keysCount++] = NULL;
+						curattr++;
+					}
+					if (curattr > prefix)
+						break;
+				}
+				else
+				{
+					curattr++;
+				}
+
+				/*
+				 * Reset for next attr.
+				 */
+				chosen = NULL;
+				impliesNN = NULL;
+			}
+
+			/*
+			 * Can we use this key as a starting boundary for this attr?
+			 *
+			 * If not, does it imply a NOT NULL constraint?  (Because
+			 * SK_SEARCHNULL keys are always assigned BTEqualStrategyNumber,
+			 * *any* inequality key works for that; we need not test.)
+			 */
+			switch (cur->sk_strategy)
+			{
+				case BTLessStrategyNumber:
+				case BTLessEqualStrategyNumber:
+					if (chosen == NULL)
+					{
+						if (ScanDirectionIsBackward(dir))
+							chosen = cur;
+						else
+							impliesNN = cur;
+					}
+					break;
+				case BTEqualStrategyNumber:
+					/* override any non-equality choice */
+					chosen = cur;
+					break;
+				case BTGreaterEqualStrategyNumber:
+				case BTGreaterStrategyNumber:
+					if (chosen == NULL)
+					{
+						if (ScanDirectionIsForward(dir))
+							chosen = cur;
+						else
+							impliesNN = cur;
+					}
+					break;
+			}
+		}
+	}
+	return keysCount;
+}
+
+/* Save an index item into so->currPos.items[itemIndex] */
+void
+_bt_saveitem(BTScanOpaque so, int itemIndex,
+			 OffsetNumber offnum, IndexTuple itup)
+{
+	BTScanPosItem *currItem = &so->currPos.items[itemIndex];
+
+	currItem->heapTid = itup->t_tid;
+	currItem->indexOffset = offnum;
+	if (so->currTuples)
+	{
+		Size		itupsz = IndexTupleSize(itup);
+
+		currItem->tupleOffset = so->currPos.nextTupleOffset;
+		memcpy(so->currTuples + so->currPos.nextTupleOffset, itup, itupsz);
+		so->currPos.nextTupleOffset += MAXALIGN(itupsz);
+	}
+}
+
+void print_itup(BlockNumber blk, IndexTuple left, IndexTuple right, Relation rel, char *extra)
+{
+	bool		isnull[INDEX_MAX_KEYS];
+	Datum		values[INDEX_MAX_KEYS];
+	char	   *lkey_desc = NULL;
+	char	   *rkey_desc;
+
+	/* Avoid infinite recursion -- don't instrument catalog indexes */
+	if (!IsCatalogRelation(rel))
+	{
+		TupleDesc	itupdesc = RelationGetDescr(rel);
+		int			natts;
+		int			indnkeyatts = rel->rd_index->indnkeyatts;
+
+		natts = BTreeTupleGetNAtts(left, rel);
+		itupdesc->natts = Min(indnkeyatts, natts);
+		memset(&isnull, 0xFF, sizeof(isnull));
+		index_deform_tuple(left, itupdesc, values, isnull);
+		rel->rd_index->indnkeyatts = natts;
+
+		/*
+		 * Since the regression tests should pass when the instrumentation
+		 * patch is applied, be prepared for BuildIndexValueDescription() to
+		 * return NULL due to security considerations.
+		 */
+		lkey_desc = BuildIndexValueDescription(rel, values, isnull);
+		if (lkey_desc && right)
+		{
+			/*
+			 * Revolting hack: modify tuple descriptor to have number of key
+			 * columns actually present in caller's pivot tuples
+			 */
+			natts = BTreeTupleGetNAtts(right, rel);
+			itupdesc->natts = Min(indnkeyatts, natts);
+			memset(&isnull, 0xFF, sizeof(isnull));
+			index_deform_tuple(right, itupdesc, values, isnull);
+			rel->rd_index->indnkeyatts = natts;
+			rkey_desc = BuildIndexValueDescription(rel, values, isnull);
+			elog(DEBUG1, "%s blk %u sk > %s, sk <= %s %s",
+				 RelationGetRelationName(rel), blk, lkey_desc, rkey_desc,
+				 extra);
+			pfree(rkey_desc);
+		}
+		else
+			elog(DEBUG1, "%s blk %u sk check %s %s",
+				 RelationGetRelationName(rel), blk, lkey_desc, extra);
+
+		/* Cleanup */
+		itupdesc->natts = IndexRelationGetNumberOfAttributes(rel);
+		rel->rd_index->indnkeyatts = indnkeyatts;
+		if (lkey_desc)
+			pfree(lkey_desc);
+	}
 }

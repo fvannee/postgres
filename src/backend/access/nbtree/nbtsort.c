@@ -571,7 +571,7 @@ _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2)
 
 	wstate.heap = btspool->heap;
 	wstate.index = btspool->index;
-	wstate.inskey = _bt_mkscankey(wstate.index, NULL);
+	wstate.inskey = _bt_mkscankey(wstate.index, NULL, NULL);
 
 	/*
 	 * We need to log index creation in WAL iff WAL archiving/streaming is

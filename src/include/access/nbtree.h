@@ -636,15 +636,37 @@ typedef struct BTSkipCompareResult
 
 typedef struct BTSkipData
 {
-	BTScanInsertData	skipScanKey;	/* used to control skipping */
-	BTScanInsertData	skipScanFwdKey;
+	/* used to control skipping
+	 * skipScanKey is a combination of currentTupleKey and fwdScanKey/bwdScanKey.
+	 * currentTupleKey contains the scan keys for the current tuple
+	 * fwdScanKey contains the scan keys for quals that would be chosen for a forward scan
+	 * bwdScanKey contains the scan keys for quals that would be chosen for a backward scan
+	 * we need both fwd and bwd, because the scan keys differ for going fwd and bwd
+	 * if a qual would be a>2 and a<5, fwd would have a>2, while bwd would have a<5
+	 */
+	BTScanInsertData	skipScanKey;
+	BTScanInsertData	currentTupleKey;
+	BTScanInsertData	fwdScanKey;
 	ScanKeyData			fwdNotNullKeys[INDEX_MAX_KEYS];
-	BTScanInsertData	skipScanBwdKey;	/* used to control skipping */
+	BTScanInsertData	bwdScanKey;
 	ScanKeyData			bwdNotNullKeys[INDEX_MAX_KEYS];
+	/* length of prefix to skip */
 	int					prefix;
+	/* whether or not skipping a prefix allows for another scan afterwards
+	 * For example in a table with idx = (a,b,c) -> SELECT * FROM tbl WHERE c=1000
+	 * if we skip over (a,b) (prefix=2), this means we now know that a and b have a specifix prefix
+	 * we can use this in an index scan from root where a=prefix_a and b=prefix_b and c=1000 */
 	bool				extraConditionsPossibleFwd, extraConditionsPossibleBwd;
+	/* storing direction of scan. overallDir contains the overall direction of the scan
+	 * overall direction means whether or not we traverse the prefixes in ascending or
+	 * descending order. curDir stores the current direction of the scan within the prefix.
+	 * Similarly, we have curMode and overallMode. curMode is normally always identical to
+	 * overallMode, except when overallMode is MINMAX. In that case, curMode is either MIN or
+	 * MAX, depending on if we're currently looking for the minimum or maximum value within the prefix.
+	 */
 	ScanDirection		curDir, overallDir;
 	ScanMode			curMode, overallMode;
+	/* for storing extended comparison result with current tuple */
 	BTSkipCompareResult	compareResult;
 	OffsetNumber		indexOffset;
 } BTSkipData;
@@ -689,7 +711,6 @@ typedef struct BTScanOpaqueData
 	int			markItemIndex;	/* itemIndex, or -1 if not valid */
 
 	/* Work space for _bt_skip */
-	BTScanInsert	skipScanKey;	/* used to control skipping */
 	BTSkip			skipData;
 
 	/* keep these last in struct for efficiency */
@@ -810,13 +831,17 @@ extern bool _bt_first(IndexScanDesc scan, ScanDirection dir);
 extern bool _bt_next(IndexScanDesc scan, ScanDirection dir, bool forceSkip);
 extern Buffer _bt_get_endpoint(Relation rel, uint32 level, bool rightmost,
 							   Snapshot snapshot);
+extern Buffer _bt_walk_left(Relation rel, Buffer buf, Snapshot snapshot);
+extern OffsetNumber _bt_binsrch(Relation rel, BTScanInsert key, Buffer buf);
+extern void _bt_initialize_more_data(BTScanOpaque so, ScanDirection dir);
+
 
 /*
  * prototypes for functions in nbtutils.c
  */
 extern bool _bt_checkkeys_threeway(IndexScanDesc scan, IndexTuple tuple, int tupnatts,
 				ScanDirection dir, bool *continuescan, int *prefixSkipIndex);
-extern BTScanInsert _bt_mkscankey(Relation rel, IndexTuple itup);
+extern BTScanInsert _bt_mkscankey(Relation rel, IndexTuple itup, BTScanInsert key);
 extern void _bt_freestack(BTStack stack);
 extern void _bt_preprocess_array_keys(IndexScanDesc scan);
 extern void _bt_start_array_keys(IndexScanDesc scan, ScanDirection dir);
@@ -847,6 +872,42 @@ extern bool _bt_check_natts(Relation rel, bool heapkeyspace, Page page,
 							OffsetNumber offnum);
 extern void _bt_check_third_page(Relation rel, Relation heap,
 								 bool needheaptidspace, Page page, IndexTuple newtup);
+extern bool _bt_create_insertion_scan_key(Relation	rel, ScanDirection dir,
+												 ScanKey* startKeys, int keysCount,
+												 BTScanInsert inskey, StrategyNumber* stratTotal,
+												 bool* goback);
+extern void _bt_set_bsearch_flags(StrategyNumber stratTotal, ScanDirection dir,
+										 bool* nextkey, bool* goback);
+extern int _bt_choose_scan_keys(ScanKey scanKeys, int numberOfKeys, ScanDirection dir,
+								ScanKey* startKeys, ScanKeyData* notnullkeys,
+								   StrategyNumber* stratTotal, int prefix);
+extern void _bt_saveitem(BTScanOpaque so, int itemIndex,
+						 OffsetNumber offnum, IndexTuple itup);
+extern void print_itup(BlockNumber blk, IndexTuple left, IndexTuple right, Relation rel, char *extra);
+
+/*
+ * prototypes for functions in nbtskip.c
+ */
+extern bool _bt_skip_enabled(BTScanOpaque so);
+extern void _bt_skip_init_curmode(ScanDirection dir, BTSkip so);
+extern void _bt_skip_reverse_curmode(BTSkip skip);
+extern void _bt_skip_update_curdir(BTSkip skip);
+extern bool _bt_skip_is_regular_mode(ScanDirection overallDir, ScanDirection dirToCompare);
+extern bool _bt_has_extra_quals_after_skip(BTSkip skip, ScanDirection dir, int keysCountFirst);
+extern void _bt_skip_create_scankeys(Relation rel, BTScanOpaque so);
+extern bool _bt_skip_is_valid(BTScanOpaque so);
+extern void _bt_update_scankey_for_prefix_skip(IndexScanDesc scan, Relation indexRel, bool alwaysUsePrefix, IndexTuple itup);
+extern void _bt_skip_update_scankey_for_extra_skip(IndexScanDesc scan, Relation indexRel, ScanDirection curDir, bool prioritizeEqual, IndexTuple itup);
+extern void _bt_skip_once(IndexScanDesc scan, IndexTuple initialSkip);
+extern void _bt_skip_extra_conditions(IndexScanDesc scan, IndexTuple initialSkip);
+extern bool _bt_skip_find_next(IndexScanDesc scan);
+extern bool _bt_skip_is_always_valid(BTScanOpaque so);
+extern void _bt_skip_until_match(IndexScanDesc scan);
+extern IndexTuple _bt_get_current_tuple(IndexScanDesc scan);
+extern bool _bt_has_results(BTScanOpaque so);
+extern void _bt_compare_current_item(IndexScanDesc scan, IndexTuple tuple, int tupnatts, ScanDirection dir);
+extern bool _bt_step_back_page(IndexScanDesc scan);
+extern bool _bt_step_forward_page(IndexScanDesc scan, BlockNumber next);
 
 /*
  * prototypes for functions in nbtvalidate.c
