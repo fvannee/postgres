@@ -1594,7 +1594,7 @@ _bt_pagedel(Relation rel, Buffer leafbuf, TransactionId *oldestBtpoXact)
 				}
 
 				/* we need an insertion scan key for the search, so build one */
-				itup_key = _bt_mkscankey(rel, targetkey);
+				itup_key = _bt_mkscankey(rel, targetkey, NULL);
 				/* find the leftmost leaf page with matching pivot/high key */
 				itup_key->pivotsearch = true;
 				stack = _bt_search(rel, itup_key, &sleafbuf, BT_READ, NULL);
