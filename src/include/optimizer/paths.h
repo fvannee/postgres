@@ -198,6 +198,10 @@ extern Path *get_cheapest_fractional_path_for_pathkeys(List *paths,
 													   Relids required_outer,
 													   double fraction);
 extern Path *get_cheapest_parallel_safe_total_inner(List *paths);
+extern int find_index_prefix_for_pathkey(PlannerInfo *root,
+					 IndexOptInfo *index,
+					 ScanDirection scandir,
+					 PathKey *pathkey);
 extern List *build_index_pathkeys(PlannerInfo *root, IndexOptInfo *index,
 								  ScanDirection scandir);
 extern List *build_partition_pathkeys(PlannerInfo *root, RelOptInfo *partrel,

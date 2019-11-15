@@ -3004,6 +3004,44 @@ create_upper_unique_path(PlannerInfo *root,
 }
 
 /*
+ * create_skipscan_unique_path
+ *	  Creates a pathnode the same as an existing IndexPath except based on
+ *	  skipping duplicate values.  This may or may not be cheaper than using
+ *	  create_upper_unique_path.
+ *
+ * The input path must be an IndexPath for an index that supports amskip.
+ */
+IndexPath *
+create_skipscan_unique_path(PlannerInfo *root, IndexOptInfo *index,
+							Path *basepath, int prefix)
+{
+	IndexPath 	*pathnode = makeNode(IndexPath);
+	int 		numDistinctRows;
+	UniqueKey *ukey;
+
+	Assert(IsA(basepath, IndexPath));
+
+	/* We don't want to modify basepath, so make a copy. */
+	memcpy(pathnode, basepath, sizeof(IndexPath));
+
+	ukey = linitial_node(UniqueKey, root->query_uniquekeys);
+
+	Assert(prefix > 0);
+	pathnode->indexskipprefix = prefix;
+	pathnode->indexdistinct = true;
+	pathnode->path.uniquekeys = root->query_uniquekeys;
+
+	numDistinctRows = estimate_num_groups(root, ukey->exprs,
+										  pathnode->path.rows,
+										  NULL);
+
+	pathnode->path.total_cost = pathnode->path.startup_cost * numDistinctRows;
+	pathnode->path.rows = numDistinctRows;
+
+	return pathnode;
+}
+
+/*
  * create_agg_path
  *	  Creates a pathnode that represents performing aggregation/grouping
  *

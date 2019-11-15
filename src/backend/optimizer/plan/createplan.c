@@ -177,15 +177,20 @@ static IndexScan *make_indexscan(List *qptlist, List *qpqual, Index scanrelid,
 								 Oid indexid, List *indexqual, List *indexqualorig,
 								 List *indexorderby, List *indexorderbyorig,
 								 List *indexorderbyops,
-								 ScanDirection indexscandir);
+								 ScanDirection indexscandir,
+								 int skipprefix,
+								 bool distinct);
 static IndexOnlyScan *make_indexonlyscan(List *qptlist, List *qpqual,
 										 Index scanrelid, Oid indexid,
 										 List *indexqual, List *indexorderby,
 										 List *indextlist,
-										 ScanDirection indexscandir);
+										 ScanDirection indexscandir,
+										 int skipprefix,
+										 bool distinct);
 static BitmapIndexScan *make_bitmap_indexscan(Index scanrelid, Oid indexid,
 											  List *indexqual,
-											  List *indexqualorig);
+											  List *indexqualorig,
+											  int skipPrefixSize);
 static BitmapHeapScan *make_bitmap_heapscan(List *qptlist,
 											List *qpqual,
 											Plan *lefttree,
@@ -2987,7 +2992,9 @@ create_indexscan_plan(PlannerInfo *root,
 												fixed_indexquals,
 												fixed_indexorderbys,
 												best_path->indexinfo->indextlist,
-												best_path->indexscandir);
+												best_path->indexscandir,
+												best_path->indexskipprefix,
+												best_path->indexdistinct);
 	else
 		scan_plan = (Scan *) make_indexscan(tlist,
 											qpqual,
@@ -2998,7 +3005,9 @@ create_indexscan_plan(PlannerInfo *root,
 											fixed_indexorderbys,
 											indexorderbys,
 											indexorderbyops,
-											best_path->indexscandir);
+											best_path->indexscandir,
+											best_path->indexskipprefix,
+											best_path->indexdistinct);
 
 	copy_generic_path_info(&scan_plan->plan, &best_path->path);
 
@@ -3288,7 +3297,8 @@ create_bitmap_subplan(PlannerInfo *root, Path *bitmapqual,
 		plan = (Plan *) make_bitmap_indexscan(iscan->scan.scanrelid,
 											  iscan->indexid,
 											  iscan->indexqual,
-											  iscan->indexqualorig);
+											  iscan->indexqualorig,
+											  iscan->indexskipprefixsize);
 		/* and set its cost/width fields appropriately */
 		plan->startup_cost = 0.0;
 		plan->total_cost = ipath->indextotalcost;
@@ -5265,7 +5275,9 @@ make_indexscan(List *qptlist,
 			   List *indexorderby,
 			   List *indexorderbyorig,
 			   List *indexorderbyops,
-			   ScanDirection indexscandir)
+			   ScanDirection indexscandir,
+			   int skipPrefixSize,
+			   bool distinct)
 {
 	IndexScan  *node = makeNode(IndexScan);
 	Plan	   *plan = &node->scan.plan;
@@ -5282,6 +5294,8 @@ make_indexscan(List *qptlist,
 	node->indexorderbyorig = indexorderbyorig;
 	node->indexorderbyops = indexorderbyops;
 	node->indexorderdir = indexscandir;
+	node->indexskipprefixsize = skipPrefixSize;
+	node->indexdistinct = distinct;
 
 	return node;
 }
@@ -5294,7 +5308,9 @@ make_indexonlyscan(List *qptlist,
 				   List *indexqual,
 				   List *indexorderby,
 				   List *indextlist,
-				   ScanDirection indexscandir)
+				   ScanDirection indexscandir,
+				   int skipPrefixSize,
+				   bool distinct)
 {
 	IndexOnlyScan *node = makeNode(IndexOnlyScan);
 	Plan	   *plan = &node->scan.plan;
@@ -5309,6 +5325,8 @@ make_indexonlyscan(List *qptlist,
 	node->indexorderby = indexorderby;
 	node->indextlist = indextlist;
 	node->indexorderdir = indexscandir;
+	node->indexskipprefixsize = skipPrefixSize;
+	node->indexdistinct = distinct;
 
 	return node;
 }
@@ -5317,7 +5335,8 @@ static BitmapIndexScan *
 make_bitmap_indexscan(Index scanrelid,
 					  Oid indexid,
 					  List *indexqual,
-					  List *indexqualorig)
+					  List *indexqualorig,
+					  int skipPrefixSize)
 {
 	BitmapIndexScan *node = makeNode(BitmapIndexScan);
 	Plan	   *plan = &node->scan.plan;
@@ -5330,6 +5349,7 @@ make_bitmap_indexscan(Index scanrelid,
 	node->indexid = indexid;
 	node->indexqual = indexqual;
 	node->indexqualorig = indexqualorig;
+	node->indexskipprefixsize = skipPrefixSize;
 
 	return node;
 }

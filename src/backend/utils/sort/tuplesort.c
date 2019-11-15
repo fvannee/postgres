@@ -991,7 +991,7 @@ tuplesort_begin_cluster(TupleDesc tupDesc,
 
 	state->tupDesc = tupDesc;	/* assume we need not copy tupDesc */
 
-	indexScanKey = _bt_mkscankey(indexRel, NULL);
+	indexScanKey = _bt_mkscankey(indexRel, NULL, NULL);
 
 	if (state->indexInfo->ii_Expressions != NULL)
 	{
@@ -1086,7 +1086,7 @@ tuplesort_begin_index_btree(Relation heapRel,
 	state->indexRel = indexRel;
 	state->enforceUnique = enforceUnique;
 
-	indexScanKey = _bt_mkscankey(indexRel, NULL);
+	indexScanKey = _bt_mkscankey(indexRel, NULL, NULL);
 
 	/* Prepare SortSupport data for each column */
 	state->sortKeys = (SortSupport) palloc0(state->nKeys *

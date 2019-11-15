@@ -3633,12 +3633,18 @@ standard_qp_callback(PlannerInfo *root, void *extra)
 
 	if (parse->distinctClause &&
 		grouping_is_sortable(parse->distinctClause))
+	{
 		root->distinct_pathkeys =
 			make_pathkeys_for_sortclauses(root,
 										  parse->distinctClause,
 										  tlist);
+		root->query_uniquekeys = build_uniquekeys(root, parse->distinctClause);
+	}
 	else
+	{
 		root->distinct_pathkeys = NIL;
+		root->query_uniquekeys = NIL;
+	}
 
 	root->sort_pathkeys =
 		make_pathkeys_for_sortclauses(root,
@@ -4832,7 +4838,7 @@ create_distinct_paths(PlannerInfo *root,
 		{
 			Path	   *path = (Path *) lfirst(lc);
 
-			if (query_has_uniquekeys_for(root, needed_pathkeys, false))
+			if (query_has_uniquekeys_for(root, path->uniquekeys, false))
 				add_path(distinct_rel, path);
 		}
 

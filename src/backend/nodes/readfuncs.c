@@ -1829,6 +1829,8 @@ _readIndexScan(void)
 	READ_NODE_FIELD(indexorderbyorig);
 	READ_NODE_FIELD(indexorderbyops);
 	READ_ENUM_FIELD(indexorderdir, ScanDirection);
+	READ_INT_FIELD(indexskipprefixsize);
+	READ_INT_FIELD(indexdistinct);
 
 	READ_DONE();
 }
@@ -1848,6 +1850,8 @@ _readIndexOnlyScan(void)
 	READ_NODE_FIELD(indexorderby);
 	READ_NODE_FIELD(indextlist);
 	READ_ENUM_FIELD(indexorderdir, ScanDirection);
+	READ_INT_FIELD(indexskipprefixsize);
+	READ_INT_FIELD(indexdistinct);
 
 	READ_DONE();
 }
@@ -1866,6 +1870,7 @@ _readBitmapIndexScan(void)
 	READ_BOOL_FIELD(isshared);
 	READ_NODE_FIELD(indexqual);
 	READ_NODE_FIELD(indexqualorig);
+	READ_INT_FIELD(indexskipprefixsize);
 
 	READ_DONE();
 }
