@@ -562,6 +562,8 @@ _outIndexScan(StringInfo str, const IndexScan *node)
 	WRITE_NODE_FIELD(indexorderbyorig);
 	WRITE_NODE_FIELD(indexorderbyops);
 	WRITE_ENUM_FIELD(indexorderdir, ScanDirection);
+	WRITE_INT_FIELD(indexskipprefixsize);
+	WRITE_INT_FIELD(indexdistinct);
 }
 
 static void
@@ -576,6 +578,9 @@ _outIndexOnlyScan(StringInfo str, const IndexOnlyScan *node)
 	WRITE_NODE_FIELD(indexorderby);
 	WRITE_NODE_FIELD(indextlist);
 	WRITE_ENUM_FIELD(indexorderdir, ScanDirection);
+	WRITE_INT_FIELD(indexskipprefixsize);
+	WRITE_INT_FIELD(indexdistinct);
+
 }
 
 static void
@@ -589,6 +594,7 @@ _outBitmapIndexScan(StringInfo str, const BitmapIndexScan *node)
 	WRITE_BOOL_FIELD(isshared);
 	WRITE_NODE_FIELD(indexqual);
 	WRITE_NODE_FIELD(indexqualorig);
+	WRITE_INT_FIELD(indexskipprefixsize);
 }
 
 static void

@@ -4835,6 +4835,70 @@ create_distinct_paths(PlannerInfo *root,
 												  path,
 												  list_length(root->distinct_pathkeys),
 												  numDistinctRows));
+
+				/* Consider index skip scan as well */
+				if (enable_indexskipscan &&
+					IsA(path, IndexPath) &&
+					((IndexPath *) path)->indexinfo->amcanskip &&
+					root->distinct_pathkeys != NIL)
+				{
+					ListCell   		*lc;
+					IndexOptInfo 	*index = NULL;
+					bool 			different_columns_order = false,
+									multiple_froms = false;
+					int 			i = 0;
+					int 			distinctPrefixKeys;
+
+					Assert(path->pathtype == T_IndexOnlyScan ||
+						   path->pathtype == T_IndexScan);
+
+					index = ((IndexPath *) path)->indexinfo;
+					distinctPrefixKeys = list_length(root->query_uniquekeys);
+
+					/*
+					 * Normally we can think about distinctPrefixKeys as just
+					 * a number of distinct keys. But if lets say we have a
+					 * distinct key a, and the index contains b, a in exactly
+					 * this order. In such situation we need to use position
+					 * of a in the index as distinctPrefixKeys, otherwise skip
+					 * will happen only by the first column.
+					 */
+					foreach(lc, root->query_uniquekeys)
+					{
+						UniqueKey *uniquekey = (UniqueKey *) lfirst(lc);
+						EquivalenceMember *em =
+							lfirst_node(EquivalenceMember,
+										list_head(uniquekey->eq_clause->ec_members));
+						Var *var = (Var *) em->em_expr;
+
+						Assert(i < index->ncolumns);
+
+						for (i = 0; i < index->ncolumns; i++)
+						{
+							if (index->indexkeys[i] == var->varattno)
+							{
+								distinctPrefixKeys = Max(i + 1, distinctPrefixKeys);
+								break;
+							}
+						}
+					}
+
+					/* we can only do this if scanning from one relation */
+					if (path->pathtype == T_IndexScan &&
+						parse->jointree != NULL &&
+						list_length(parse->jointree->fromlist) > 1)
+							multiple_froms = true;
+
+					if (!different_columns_order &&	!multiple_froms)
+					{
+						add_path(distinct_rel, (Path *)
+								 create_skipscan_unique_path(root,
+															 distinct_rel,
+															 path,
+															 distinctPrefixKeys,
+															 numDistinctRows));
+					}
+				}
 			}
 		}
 
