@@ -780,6 +780,16 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	{
 		IndexPath  *ipath = (IndexPath *) lfirst(lc);
 
+		/*
+		 * To prevent unique paths from index skip scans being potentially used
+		 * when not needed scan keep them in a separate pathlist.
+		*/
+		if (ipath->indexdistinct)
+		{
+			add_unique_path(rel, (Path *) ipath);
+			continue;
+		}
+
 		if (index->amhasgettuple)
 			add_path(rel, (Path *) ipath);
 
@@ -868,6 +878,7 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	bool		pathkeys_possibly_useful;
 	bool		index_is_ordered;
 	bool		index_only_scan;
+	bool		can_skip;
 	int			indexcol;
 
 	/*
@@ -1017,6 +1028,9 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	index_only_scan = (scantype != ST_BITMAPSCAN &&
 					   check_index_only(rel, index));
 
+	/* Check if an index skip scan is possible. */
+	can_skip = enable_indexskipscan & index->amcanskip;
+
 	/*
 	 * 4. Generate an indexscan path if there are relevant restriction clauses
 	 * in the current clauses, OR the index ordering is potentially useful for
@@ -1039,6 +1053,33 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 								  loop_count,
 								  false);
 		result = lappend(result, ipath);
+
+		/* Consider index skip scan as well */
+		if (root->query_uniquekeys != NULL && can_skip)
+		{
+			int numusefulkeys = list_length(useful_pathkeys);
+			int numsortkeys = list_length(root->query_pathkeys);
+
+			if (numusefulkeys == numsortkeys)
+			{
+				int prefix;
+				if (list_length(root->distinct_pathkeys) > 0)
+					prefix = find_index_prefix_for_pathkey(root,
+														   index,
+														   ForwardScanDirection,
+														   llast_node(PathKey,
+														   root->distinct_pathkeys));
+				else
+					/* all are distinct keys are constant and optimized away.
+					 * skipping with 1 is sufficient as all are constant anyway
+					 */
+					prefix = 1;
+
+				result = lappend(result,
+								 create_skipscan_unique_path(root, index,
+															 (Path *) ipath, prefix));
+			}
+		}
 
 		/*
 		 * If appropriate, consider parallel index scan.  We don't allow
@@ -1094,6 +1135,33 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 									  loop_count,
 									  false);
 			result = lappend(result, ipath);
+
+			/* Consider index skip scan as well */
+			if (root->query_uniquekeys != NULL && can_skip)
+			{
+				int numusefulkeys = list_length(useful_pathkeys);
+				int numsortkeys = list_length(root->query_pathkeys);
+
+				if (numusefulkeys == numsortkeys)
+				{
+					int prefix;
+					if (list_length(root->distinct_pathkeys) > 0)
+						prefix = find_index_prefix_for_pathkey(root,
+															   index,
+															   BackwardScanDirection,
+															   llast_node(PathKey,
+															   root->distinct_pathkeys));
+					else
+						/* all are distinct keys are constant and optimized away.
+						 * skipping with 1 is sufficient as all are constant anyway
+						 */
+						prefix = 1;
+
+					result = lappend(result,
+									 create_skipscan_unique_path(root, index,
+																 (Path *) ipath, prefix));
+				}
+			}
 
 			/* If appropriate, consider parallel index scan */
 			if (index->amcanparallel &&
