@@ -395,18 +395,18 @@ SELECT DISTINCT on (a, b) a, b FROM distinct_a WHERE b = 2;
 
 EXPLAIN (COSTS OFF)
 SELECT DISTINCT a FROM distinct_a WHERE b = 2;
-                     QUERY PLAN                     
-----------------------------------------------------
- Index Only Scan using distinct_a_b_a on distinct_a
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Index Only Scan using distinct_a_a_b_idx on distinct_a
    Skip scan: Distinct only
    Index Cond: (b = 2)
 (3 rows)
 
 EXPLAIN (COSTS OFF)
 SELECT DISTINCT on (a, b) a, b FROM distinct_a WHERE b = 2;
-                     QUERY PLAN                     
-----------------------------------------------------
- Index Only Scan using distinct_a_b_a on distinct_a
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Index Only Scan using distinct_a_a_b_idx on distinct_a
    Skip scan: Distinct only
    Index Cond: (b = 2)
 (3 rows)
@@ -633,8 +633,9 @@ FROM distinct_a WHERE a = 1 ORDER BY a;
    ->  Bitmap Heap Scan on distinct_a
          Recheck Cond: (a = 1)
          ->  Bitmap Index Scan on distinct_a_a_b_idx
+               Skip scan: All
                Index Cond: (a = 1)
-(5 rows)
+(6 rows)
 
 -- check colums order
 SELECT DISTINCT a FROM distinct_a WHERE b = 2 AND c = 10;

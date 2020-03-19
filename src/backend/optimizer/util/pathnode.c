@@ -1029,6 +1029,13 @@ create_index_path(PlannerInfo *root,
 	pathnode->indexorderbycols = indexorderbycols;
 	pathnode->indexscandir = indexscandir;
 
+	/* @todo this is just for testing purposes.
+	 * we need a better selection mechanism for when to
+	 * use skip scan and when to use regular index scan
+	 */
+	if (!partial_path && index->amcanskip && enable_indexskipscan)
+		pathnode->indexskipprefix = 10;
+
 	cost_index(pathnode, root, loop_count, partial_path);
 
 	return pathnode;
