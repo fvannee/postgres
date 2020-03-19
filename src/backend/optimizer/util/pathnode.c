@@ -1019,7 +1019,8 @@ create_index_path(PlannerInfo *root,
 				  bool indexonly,
 				  Relids required_outer,
 				  double loop_count,
-				  bool partial_path)
+				  bool partial_path,
+				  int skip_prefix)
 {
 	IndexPath  *pathnode = makeNode(IndexPath);
 	RelOptInfo *rel = index->rel;
@@ -1039,6 +1040,7 @@ create_index_path(PlannerInfo *root,
 	pathnode->indexorderbys = indexorderbys;
 	pathnode->indexorderbycols = indexorderbycols;
 	pathnode->indexscandir = indexscandir;
+	pathnode->indexskipprefix = skip_prefix;
 
 	cost_index(pathnode, root, loop_count, partial_path);
 
