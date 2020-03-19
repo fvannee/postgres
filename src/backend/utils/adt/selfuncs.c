@@ -210,7 +210,9 @@ static bool get_actual_variable_endpoint(Relation heapRel,
 										 MemoryContext outercontext,
 										 Datum *endpointDatum);
 static RelOptInfo *find_join_input_rel(PlannerInfo *root, Relids relids);
-
+static double estimate_num_groups_internal(PlannerInfo *root, List *groupExprs,
+									double input_rows, double rel_input_rows,
+									List **pgset);
 
 /*
  *		eqsel			- Selectivity of "=" for any data types.
@@ -3357,6 +3359,19 @@ double
 estimate_num_groups(PlannerInfo *root, List *groupExprs, double input_rows,
 					List **pgset)
 {
+	return estimate_num_groups_internal(root, groupExprs, input_rows, -1, pgset);
+}
+
+/*
+ * Same as estimate_num_groups, but with an extra argument to control
+ * the estimation used for the input rows of the relation. If
+ * rel_input_rows < 0, it uses the the original planner estimation for the
+ * individual rels, else if uses the estimation as provided to the function.
+ */
+static double
+estimate_num_groups_internal(PlannerInfo *root, List *groupExprs, double input_rows, double rel_input_rows,
+					List **pgset)
+{
 	List	   *varinfos = NIL;
 	double		srf_multiplier = 1.0;
 	double		numdistinct;
@@ -3510,6 +3525,12 @@ estimate_num_groups(PlannerInfo *root, List *groupExprs, double input_rows,
 		int			relvarcount = 0;
 		List	   *newvarinfos = NIL;
 		List	   *relvarinfos = NIL;
+		double this_rel_input_rows;
+
+		if (rel_input_rows < 0.0)
+			this_rel_input_rows = rel->rows;
+		else
+			this_rel_input_rows = rel_input_rows;
 
 		/*
 		 * Split the list of varinfos in two - one for the current rel, one
@@ -3607,7 +3628,7 @@ estimate_num_groups(PlannerInfo *root, List *groupExprs, double input_rows,
 			 * guarding against division by zero when reldistinct is zero.
 			 * Also skip this if we know that we are returning all rows.
 			 */
-			if (reldistinct > 0 && rel->rows < rel->tuples)
+			if (reldistinct > 0 && this_rel_input_rows < rel->tuples)
 			{
 				/*
 				 * Given a table containing N rows with n distinct values in a
@@ -3644,7 +3665,7 @@ estimate_num_groups(PlannerInfo *root, List *groupExprs, double input_rows,
 				 * works well even when n is small.
 				 */
 				reldistinct *=
-					(1 - pow((rel->tuples - rel->rows) / rel->tuples,
+					(1 - pow((rel->tuples - this_rel_input_rows) / rel->tuples,
 							 rel->tuples / reldistinct));
 			}
 			reldistinct = clamp_row_est(reldistinct);
@@ -6244,8 +6265,10 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	double		numIndexTuples;
 	Cost		descentCost;
 	List	   *indexBoundQuals;
+	List	   *prefixBoundQuals;
 	int			indexcol;
 	bool		eqQualHere;
+	bool		stillEq;
 	bool		found_saop;
 	bool		found_is_null_op;
 	double		num_sa_scans;
@@ -6269,9 +6292,11 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	 * considered to act the same as it normally does.
 	 */
 	indexBoundQuals = NIL;
+	prefixBoundQuals = NIL;
 	indexcol = 0;
 	eqQualHere = false;
 	found_saop = false;
+	stillEq = true;
 	found_is_null_op = false;
 	num_sa_scans = 1;
 	foreach(lc, path->indexclauses)
@@ -6283,11 +6308,18 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		{
 			/* Beginning of a new column's quals */
 			if (!eqQualHere)
-				break;			/* done if no '=' qual for indexcol */
+			{
+				stillEq = false;
+				/* done if no '=' qual for indexcol and we're past the skip prefix */
+				if (path->indexskipprefix <= indexcol)
+					break;
+			}
 			eqQualHere = false;
 			indexcol++;
+			while (indexcol != iclause->indexcol && path->indexskipprefix > indexcol)
+				indexcol++;
 			if (indexcol != iclause->indexcol)
-				break;			/* no quals at all for indexcol */
+				break; /* no quals at all for indexcol */
 		}
 
 		/* Examine each indexqual associated with this index clause */
@@ -6319,7 +6351,7 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 				clause_op = saop->opno;
 				found_saop = true;
 				/* count number of SA scans induced by indexBoundQuals only */
-				if (alength > 1)
+				if (alength > 1 && stillEq)
 					num_sa_scans *= alength;
 			}
 			else if (IsA(clause, NullTest))
@@ -6347,7 +6379,14 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 					eqQualHere = true;
 			}
 
-			indexBoundQuals = lappend(indexBoundQuals, rinfo);
+			/* we keep two lists here, one with all quals up until the prefix
+			 * and one with only the quals until the first inequality.
+			 * we need the list with prefixes later
+			 */
+			if (stillEq)
+				indexBoundQuals = lappend(indexBoundQuals, rinfo);
+			if (path->indexskipprefix > 0)
+				prefixBoundQuals = lappend(prefixBoundQuals, rinfo);
 		}
 	}
 
@@ -6373,7 +6412,10 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		 * index-bound quals to produce a more accurate idea of the number of
 		 * rows covered by the bound conditions.
 		 */
-		selectivityQuals = add_predicate_to_index_quals(index, indexBoundQuals);
+		if (path->indexskipprefix > 0)
+			selectivityQuals = add_predicate_to_index_quals(index, prefixBoundQuals);
+		else
+			selectivityQuals = add_predicate_to_index_quals(index, indexBoundQuals);
 
 		btreeSelectivity = clauselist_selectivity(root, selectivityQuals,
 												  index->rel->relid,
@@ -6383,7 +6425,7 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 		/*
 		 * As in genericcostestimate(), we have to adjust for any
-		 * ScalarArrayOpExpr quals included in indexBoundQuals, and then round
+		 * ScalarArrayOpExpr quals included in prefixBoundQuals, and then round
 		 * to integer.
 		 */
 		numIndexTuples = rint(numIndexTuples / num_sa_scans);
@@ -6428,6 +6470,99 @@ btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	descentCost = (index->tree_height + 1) * 50.0 * cpu_operator_cost;
 	costs.indexStartupCost += descentCost;
 	costs.indexTotalCost += costs.num_sa_scans * descentCost;
+
+	/*
+	 * Add extra costs for using an index skip scan.
+	 * The index skip scan could have significantly lower cost until now,
+	 * due to the different row estimation used (all the quals up to prefix,
+	 * rather than all the quals up to the first non-equality operator).
+	 * However, there are extra costs incurred for
+	 * a) setting up the scan
+	 * b) doing additional scans from root
+	 * c) small extra cost per tuple comparison
+	 * We add those here
+	 */
+	if (path->indexskipprefix > 0)
+	{
+		List *exprlist = NULL;
+		double numgroups_estimate;
+		int i = 0;
+		ListCell *indexpr_item = list_head(path->indexinfo->indexprs);
+		List	   *selectivityQuals;
+		Selectivity btreeSelectivity;
+		double estimatedIndexTuplesNoPrefix;
+
+		/* some rather arbitrary extra cost for preprocessing structures needed for skip scan */
+		costs.indexStartupCost += 200.0 * cpu_operator_cost;
+		costs.indexTotalCost += 200.0 * cpu_operator_cost;
+
+		/*
+		 * In order to reliably get a cost estimation for the number of scans we have to do from root,
+		 * we need some estimation on the number of distinct prefixes that exist. Therefore, we need
+		 * a different selectivity approximation (this time we do need to use the clauses until the first
+		 * non-equality operator). Using that, we can estimate the number of groups
+		 */
+		for (i = 0; i < path->indexinfo->nkeycolumns && i < path->indexskipprefix; i++)
+		{
+			Expr *expr = NULL;
+			int attr = path->indexinfo->indexkeys[i];
+			if(attr > 0)
+			{
+				TargetEntry *tentry = get_tle_by_resno(path->indexinfo->indextlist, i + 1);
+				Assert(tentry != NULL);
+				expr = tentry->expr;
+			}
+			else if (attr == 0)
+			{
+				/* Expression index */
+				expr = lfirst(indexpr_item);
+				indexpr_item = lnext(path->indexinfo->indexprs, indexpr_item);
+			}
+			else /* attr < 0 */
+			{
+				/* Index on system column is not supported */
+				Assert(false);
+			}
+
+			exprlist = lappend(exprlist, expr);
+		}
+
+		selectivityQuals = add_predicate_to_index_quals(index, indexBoundQuals);
+
+		btreeSelectivity = clauselist_selectivity(root, selectivityQuals,
+												  index->rel->relid,
+												  JOIN_INNER,
+												  NULL);
+		estimatedIndexTuplesNoPrefix = btreeSelectivity * index->rel->tuples;
+
+		/*
+		 * As in genericcostestimate(), we have to adjust for any
+		 * ScalarArrayOpExpr quals included in prefixBoundQuals, and then round
+		 * to integer.
+		 */
+		estimatedIndexTuplesNoPrefix = rint(estimatedIndexTuplesNoPrefix / num_sa_scans);
+
+		numgroups_estimate = estimate_num_groups_internal(
+					root, exprlist, estimatedIndexTuplesNoPrefix,
+					estimatedIndexTuplesNoPrefix, NULL);
+
+		/*
+		 * For each distinct prefix value we add descending cost as.
+		 * This is similar to the startup cost calculation for regular scans.
+		 * We can do at most 2 scans from root per distinct prefix, so multiply by 2.
+		 * Also add some CPU processing cost per page that we need to process, plus
+		 * some additional one-time cost for scanning the leaf page. This is a more
+		 * expensive estimation than the per-page cpu cost for the regular index scan.
+		 * This is intentional, because the index skip scan does more processing on
+		 * the leaf page.
+		 */
+		if (index->tuples > 0)
+			descentCost = ceil(log(index->tuples) / log(2.0)) * cpu_operator_cost * 2;
+		else
+			descentCost = 0;
+		descentCost += (index->tree_height + 1) * 50.0 * cpu_operator_cost * 2 + 200 * cpu_operator_cost;
+		costs.indexTotalCost += costs.num_sa_scans * descentCost * numgroups_estimate;
+	}
 
 	/*
 	 * If we can get an estimate of the first column's ordering correlation C

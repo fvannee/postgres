@@ -188,6 +188,17 @@ static Expr *match_clause_to_ordering_op(IndexOptInfo *index,
 static bool ec_member_matches_indexcol(PlannerInfo *root, RelOptInfo *rel,
 									   EquivalenceClass *ec, EquivalenceMember *em,
 									   void *arg);
+static List* add_possible_index_skip_paths(List* result,
+										  PlannerInfo *root,
+										  IndexOptInfo *index,
+										  List *indexclauses,
+										  List *indexorderbys,
+										  List *indexorderbycols,
+										  List *pathkeys,
+										  ScanDirection indexscandir,
+										  bool indexonly,
+										  Relids required_outer,
+										  double loop_count);
 
 
 /*
@@ -817,6 +828,136 @@ get_index_paths(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * Find available index skip paths and add them to the path list
+ */
+static List* add_possible_index_skip_paths(List* result,
+										  PlannerInfo *root,
+										  IndexOptInfo *index,
+										  List *indexclauses,
+										  List *indexorderbys,
+										  List *indexorderbycols,
+										  List *pathkeys,
+										  ScanDirection indexscandir,
+										  bool indexonly,
+										  Relids required_outer,
+										  double loop_count)
+{
+	int			indexcol;
+	bool		eqQualHere;
+	bool		eqQualPrev;
+	bool		eqSoFar;
+	ListCell   *lc;
+
+	/*
+	 * We need to find possible prefixes to use for the skip scan
+	 * Any useful prefix is one just before an index clause, unless
+	 * all clauses so far have been equal.
+	 * For example, on an index (a,b,c), the qual b=1 would
+	 * mean that an interesting skip prefix could be 1.
+	 * For qual a=1 AND b=1, it is not interesting to skip with
+	 * prefix 1, because the value of a is fixed already.
+	 */
+	indexcol = 0;
+	eqQualHere = false;
+	eqQualPrev = false;
+	eqSoFar = true;
+	foreach(lc, indexclauses)
+	{
+		IndexClause *iclause = lfirst_node(IndexClause, lc);
+		ListCell   *lc2;
+
+		if (indexcol != iclause->indexcol)
+		{
+			if (!eqQualHere)
+				eqSoFar = false;
+
+			/* Beginning of a new column's quals */
+			if (!eqQualPrev && !eqSoFar)
+			{
+				/* We have a qual on current column,
+				 * there is no equality qual on the previous column,
+				 * not all of the previous quals are equality so far
+				 * (last one is special case for the first column in the index).
+				 * Optimal conditions to try an index skip path.
+				 */
+				IndexPath *ipath = create_index_path(root, index,
+										  indexclauses,
+										  indexorderbys,
+										  indexorderbycols,
+										  pathkeys,
+										  indexscandir,
+										  indexonly,
+										  required_outer,
+										  loop_count,
+										  false,
+										  iclause->indexcol);
+				result = lappend(result, ipath);
+			}
+
+			eqQualPrev = eqQualHere;
+			eqQualHere = false;
+			indexcol++;
+			/* if the clause is not for this index col, increment until it is */
+			while (indexcol != iclause->indexcol)
+			{
+				eqQualPrev = false;
+				eqSoFar = false;
+				indexcol++;
+			}
+		}
+
+		/* Examine each indexqual associated with this index clause */
+		foreach(lc2, iclause->indexquals)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+			Expr	   *clause = rinfo->clause;
+			Oid			clause_op = InvalidOid;
+			int			op_strategy;
+
+			if (IsA(clause, OpExpr))
+			{
+				OpExpr	   *op = (OpExpr *) clause;
+				clause_op = op->opno;
+			}
+			else if (IsA(clause, RowCompareExpr))
+			{
+				RowCompareExpr *rc = (RowCompareExpr *) clause;
+				clause_op = linitial_oid(rc->opnos);
+			}
+			else if (IsA(clause, ScalarArrayOpExpr))
+			{
+				ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+				clause_op = saop->opno;
+			}
+			else if (IsA(clause, NullTest))
+			{
+				NullTest   *nt = (NullTest *) clause;
+
+				if (nt->nulltesttype == IS_NULL)
+				{
+					/* IS NULL is like = for selectivity purposes */
+					eqQualHere = true;
+				}
+			}
+			else
+				elog(ERROR, "unsupported indexqual type: %d",
+					 (int) nodeTag(clause));
+
+			/* check for equality operator */
+			if (OidIsValid(clause_op))
+			{
+				op_strategy = get_op_opfamily_strategy(clause_op,
+													   index->opfamily[indexcol]);
+				Assert(op_strategy != 0);	/* not a member of opfamily?? */
+				if (op_strategy == BTEqualStrategyNumber)
+					eqQualHere = true;
+			}
+		}
+	}
+	return result;
+}
+
+/*
  * build_index_paths
  *	  Given an index and a set of index clauses for it, construct zero
  *	  or more IndexPaths. It also constructs zero or more partial IndexPaths.
@@ -1051,8 +1192,24 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 								  index_only_scan,
 								  outer_relids,
 								  loop_count,
-								  false);
+								  false,
+								  0);
 		result = lappend(result, ipath);
+
+		if (can_skip)
+		{
+			result = add_possible_index_skip_paths(result, root, index,
+												   index_clauses,
+												   orderbyclauses,
+												   orderbyclausecols,
+												   useful_pathkeys,
+												   index_is_ordered ?
+												   ForwardScanDirection :
+												   NoMovementScanDirection,
+												   index_only_scan,
+												   outer_relids,
+												   loop_count);
+		}
 
 		/* Consider index skip scan as well */
 		if (root->query_uniquekeys != NULL && can_skip)
@@ -1100,7 +1257,8 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 									  index_only_scan,
 									  outer_relids,
 									  loop_count,
-									  true);
+									  true,
+									  0);
 
 			/*
 			 * if, after costing the path, we find that it's not worth using
@@ -1133,8 +1291,22 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 									  index_only_scan,
 									  outer_relids,
 									  loop_count,
-									  false);
+									  false,
+									  0);
 			result = lappend(result, ipath);
+
+			if (can_skip)
+			{
+				result = add_possible_index_skip_paths(result, root, index,
+													   index_clauses,
+													   NIL,
+													   NIL,
+													   useful_pathkeys,
+													   BackwardScanDirection,
+													   index_only_scan,
+													   outer_relids,
+													   loop_count);
+			}
 
 			/* Consider index skip scan as well */
 			if (root->query_uniquekeys != NULL && can_skip)
@@ -1177,7 +1349,8 @@ build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 										  index_only_scan,
 										  outer_relids,
 										  loop_count,
-										  true);
+										  true,
+										  0);
 
 				/*
 				 * if, after costing the path, we find that it's not worth
