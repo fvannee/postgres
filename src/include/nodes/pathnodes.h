@@ -709,6 +709,8 @@ typedef struct RelOptInfo
 	PlannerInfo *subroot;		/* if subquery */
 	List	   *subplan_params; /* if subquery */
 	int			rel_parallel_workers;	/* wanted number of parallel workers */
+	/* Not null attrs, start from -FirstLowInvalidHeapAttributeNumber */
+	Bitmapset		*notnullattrs;
 
 	/* Information about foreign tables and foreign joins */
 	Oid			serverid;		/* identifies server for the table or join */

@@ -1005,6 +1005,7 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 		RelOptInfo *childrel;
 		ListCell   *parentvars;
 		ListCell   *childvars;
+		int i = -1;
 
 		/* append_rel_list contains all append rels; ignore others */
 		if (appinfo->parent_relid != parentRTindex)
@@ -1060,6 +1061,36 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 			adjust_appendrel_attrs(root,
 								   (Node *) rel->reltarget->exprs,
 								   1, &appinfo);
+
+		/* Copy notnullattrs. */
+		while ((i = bms_next_member(rel->notnullattrs, i)) > 0)
+		{
+			AttrNumber attno = i + FirstLowInvalidHeapAttributeNumber;
+			AttrNumber child_attno;
+			if (attno == 0)
+			{
+				/* Whole row is not null, so must be same for child */
+				childrel->notnullattrs = bms_add_member(childrel->notnullattrs,
+														attno - FirstLowInvalidHeapAttributeNumber);
+				break;
+			}
+			if (attno < 0 )
+				/* no need to translate system column */
+				child_attno = attno;
+			else
+			{
+				Node * node = list_nth(appinfo->translated_vars, attno - 1);
+				if (!IsA(node, Var))
+					/* This may happens at UNION case, like (SELECT a FROM t1 UNION SELECT a + 3
+					 * FROM t2) t and we know t.a is not null
+					 */
+					continue;
+				child_attno = castNode(Var, node)->varattno;
+			}
+
+			childrel->notnullattrs = bms_add_member(childrel->notnullattrs,
+													child_attno - FirstLowInvalidHeapAttributeNumber);
+		}
 
 		/*
 		 * We have to make child entries in the EquivalenceClass data
