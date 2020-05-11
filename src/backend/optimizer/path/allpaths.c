@@ -579,6 +579,12 @@ set_plain_rel_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	 */
 	check_index_predicates(root, rel);
 
+	/*
+	 * Now that we've marked which partial indexes are suitable, we can now
+	 * build the relation's unique keys.
+	 */
+	populate_baserel_uniquekeys(root, rel, rel->indexlist);
+
 	/* Mark rel with estimated output rows, width, etc */
 	set_baserel_size_estimates(root, rel);
 }
@@ -1310,6 +1316,8 @@ set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 
 	/* Add paths to the append relation. */
 	add_paths_to_append_rel(root, rel, live_childrels);
+	if (IS_PARTITIONED_REL(rel))
+		populate_partitionedrel_uniquekeys(root, rel, live_childrels);
 }
 
 
@@ -2382,6 +2390,8 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				 create_subqueryscan_path(root, rel, subpath,
 										  pathkeys, required_outer));
 	}
+
+	convert_subquery_uniquekeys(root, rel, sub_final_rel);
 
 	/* If outer rel allows parallelism, do same for partial paths. */
 	if (rel->consider_parallel && bms_is_empty(required_outer))
