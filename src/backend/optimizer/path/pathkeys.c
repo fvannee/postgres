@@ -29,6 +29,7 @@
 #include "utils/lsyscache.h"
 
 
+static bool pathkey_is_unique(PathKey *new_pathkey, List *pathkeys);
 static bool pathkey_is_redundant(PathKey *new_pathkey, List *pathkeys);
 static bool matches_boolean_partition_clause(RestrictInfo *rinfo,
 											 RelOptInfo *partrel,
@@ -93,6 +94,29 @@ make_canonical_pathkey(PlannerInfo *root,
 	MemoryContextSwitchTo(oldcontext);
 
 	return pk;
+}
+
+/*
+ * pathkey_is_unique
+ *	   Checks if the new pathkey's equivalence class is the same as that of
+ *     any existing member of the pathkey list.
+ */
+static bool
+pathkey_is_unique(PathKey *new_pathkey, List *pathkeys)
+{
+	EquivalenceClass *new_ec = new_pathkey->pk_eclass;
+	ListCell   *lc;
+
+	/* If same EC already is already in the list, then not unique */
+	foreach(lc, pathkeys)
+	{
+		PathKey    *old_pathkey = (PathKey *) lfirst(lc);
+
+		if (new_ec == old_pathkey->pk_eclass)
+			return false;
+	}
+
+	return true;
 }
 
 /*
@@ -1148,6 +1172,41 @@ make_pathkeys_for_sortclauses(PlannerInfo *root,
 		if (!pathkey_is_redundant(pathkey, pathkeys))
 			pathkeys = lappend(pathkeys, pathkey);
 	}
+	return pathkeys;
+}
+
+/*
+ * make_pathkeys_for_uniquekeyclauses
+ *		Generate a pathkeys list to be used for uniquekey clauses
+ */
+List *
+make_pathkeys_for_uniquekeys(PlannerInfo *root,
+							 List *sortclauses,
+							 List *tlist)
+{
+	List	   *pathkeys = NIL;
+	ListCell   *l;
+
+	foreach(l, sortclauses)
+	{
+		SortGroupClause *sortcl = (SortGroupClause *) lfirst(l);
+		Expr	   *sortkey;
+		PathKey    *pathkey;
+
+		sortkey = (Expr *) get_sortgroupclause_expr(sortcl, tlist);
+		Assert(OidIsValid(sortcl->sortop));
+		pathkey = make_pathkey_from_sortop(root,
+										   sortkey,
+										   root->nullable_baserels,
+										   sortcl->sortop,
+										   sortcl->nulls_first,
+										   sortcl->tleSortGroupRef,
+										   true);
+
+		if (pathkey_is_unique(pathkey, pathkeys))
+			pathkeys = lappend(pathkeys, pathkey);
+	}
+
 	return pathkeys;
 }
 

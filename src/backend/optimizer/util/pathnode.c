@@ -416,10 +416,10 @@ set_cheapest(RelOptInfo *parent_rel)
  * 'parent_rel' is the relation entry to which the path corresponds.
  * 'new_path' is a potential path for parent_rel.
  *
- * Returns nothing, but modifies parent_rel->pathlist.
+ * Returns modified pathlist.
  */
-void
-add_path(RelOptInfo *parent_rel, Path *new_path)
+static List *
+add_path_to(RelOptInfo *parent_rel, List *pathlist, Path *new_path)
 {
 	bool		accept_new = true;	/* unless we find a superior old path */
 	int			insert_at = 0;	/* where to insert new item */
@@ -440,7 +440,7 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	 * for more than one old path to be tossed out because new_path dominates
 	 * it.
 	 */
-	foreach(p1, parent_rel->pathlist)
+	foreach(p1, pathlist)
 	{
 		Path	   *old_path = (Path *) lfirst(p1);
 		bool		remove_old = false; /* unless new proves superior */
@@ -584,8 +584,7 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 		 */
 		if (remove_old)
 		{
-			parent_rel->pathlist = foreach_delete_current(parent_rel->pathlist,
-														  p1);
+			pathlist = foreach_delete_current(pathlist, p1);
 
 			/*
 			 * Delete the data pointed-to by the deleted cell, if possible
@@ -612,8 +611,7 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	if (accept_new)
 	{
 		/* Accept the new path: insert it at proper place in pathlist */
-		parent_rel->pathlist =
-			list_insert_nth(parent_rel->pathlist, insert_at, new_path);
+		pathlist = list_insert_nth(pathlist, insert_at, new_path);
 	}
 	else
 	{
@@ -621,6 +619,23 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 		if (!IsA(new_path, IndexPath))
 			pfree(new_path);
 	}
+
+	return pathlist;
+}
+
+void
+add_path(RelOptInfo *parent_rel, Path *new_path)
+{
+	parent_rel->pathlist = add_path_to(parent_rel,
+									   parent_rel->pathlist, new_path);
+}
+
+void
+add_unique_path(RelOptInfo *parent_rel, Path *new_path)
+{
+	parent_rel->unique_pathlist = add_path_to(parent_rel,
+											  parent_rel->unique_pathlist,
+											  new_path);
 }
 
 /*
@@ -2571,6 +2586,7 @@ create_projection_path(PlannerInfo *root,
 	pathnode->path.pathkeys = subpath->pathkeys;
 
 	pathnode->subpath = subpath;
+	pathnode->path.uniquekeys = subpath->uniquekeys;
 
 	/*
 	 * We might not need a separate Result node.  If the input plan node type
