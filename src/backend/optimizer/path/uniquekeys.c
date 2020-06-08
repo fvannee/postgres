@@ -1129,3 +1129,66 @@ add_combined_uniquekey(RelOptInfo *joinrel,
 	}
 	return false;
 }
+
+List*
+build_uniquekeys(PlannerInfo *root, List *sortclauses)
+{
+	List *result = NIL;
+	List *sortkeys;
+	ListCell *l;
+	List *exprs = NIL;
+
+	sortkeys = make_pathkeys_for_uniquekeys(root,
+											sortclauses,
+											root->processed_tlist);
+
+	/* Create a uniquekey and add it to the list */
+	foreach(l, sortkeys)
+	{
+		PathKey    *pathkey = (PathKey *) lfirst(l);
+		EquivalenceClass *ec = pathkey->pk_eclass;
+		EquivalenceMember *mem = (EquivalenceMember*) lfirst(list_head(ec->ec_members));
+		if (EC_MUST_BE_REDUNDANT(ec))
+			continue;
+		exprs = lappend(exprs, mem->em_expr);
+	}
+
+	result = lappend(result, makeUniqueKey(exprs, false));
+
+	return result;
+}
+
+bool
+query_has_uniquekeys_for(PlannerInfo *root, List *pathuniquekeys,
+						 bool allow_multinulls)
+{
+	ListCell *lc;
+	ListCell *lc2;
+
+	/* root->query_uniquekeys are the requested DISTINCT clauses on query level
+	 * pathuniquekeys are the unique keys on current path.
+	 * All requested query_uniquekeys must be satisfied by the pathuniquekeys
+	 */
+	foreach(lc, root->query_uniquekeys)
+	{
+		UniqueKey *query_ukey = lfirst_node(UniqueKey, lc);
+		bool satisfied = false;
+		foreach(lc2, pathuniquekeys)
+		{
+			UniqueKey *ukey = lfirst_node(UniqueKey, lc2);
+			if (ukey->multi_nullvals && !allow_multinulls)
+				continue;
+			if (list_length(ukey->exprs) == 0 &&
+				list_length(query_ukey->exprs) != 0)
+				continue;
+			if (list_is_subset(ukey->exprs, query_ukey->exprs))
+			{
+				satisfied = true;
+				break;
+			}
+		}
+		if (!satisfied)
+			return false;
+	}
+	return true;
+}
