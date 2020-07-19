@@ -1637,8 +1637,8 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 				 * Assume that we acquired a buffer pin for the purposes of
 				 * Valgrind buffer client checks (even in !result case) to
 				 * keep things simple.  Buffers that are unsafe to access are
-				 * not generally guaranteed to be marked undefined or
-				 * non-accessible in any case.
+				 * not generally guaranteed to be marked undefined in any
+				 * case.
 				 */
 				VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
 				
