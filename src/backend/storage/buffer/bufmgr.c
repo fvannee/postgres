@@ -1633,13 +1633,31 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 											   buf_state))
 			{
 				result = (buf_state & BM_VALID) != 0;
+				/*
+				 * Assume that we acquired a buffer pin for the purposes of
+				 * Valgrind buffer client checks (even in !result case) to
+				 * keep things simple.  Buffers that are unsafe to access are
+				 * not generally guaranteed to be marked undefined or
+				 * non-accessible in any case.
+				 */
+				VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
+				
 				break;
 			}
 		}
 	}
 	else
 	{
-		/* If we previously pinned the buffer, it must surely be valid */
+		/*
+		 * If we previously pinned the buffer, it must surely be valid.
+		 *
+		 * Note: We deliberately avoid a Valgrind client request here.
+		 * Individual access methods can optionally superimpose buffer page
+		 * client requests on top of our client requests to enforce that
+		 * buffers are only accessed while locked (and pinned).  It's possible
+		 * that the buffer page is legitimately non-accessible here.  We
+		 * cannot meddle with that.
+		 */
 		result = true;
 	}
 
@@ -1728,6 +1746,14 @@ UnpinBuffer(BufferDesc *buf, bool fixOwner)
 		uint32		buf_state;
 		uint32		old_buf_state;
 
+		/*
+		 * Mark buffer non-accessible to Valgrind.
+		 *
+		 * Note that the buffer may have already been marked non-accessible
+		 * within access method code that enforces that buffers are only
+		 * accessed while a buffer lock is held.
+		 */
+		VALGRIND_MAKE_MEM_NOACCESS(BufHdrGetBlock(buf), BLCKSZ);
 		/* I'd better not still hold any locks on the buffer */
 		Assert(!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)));
 		Assert(!LWLockHeldByMe(BufferDescriptorGetIOLock(buf)));
