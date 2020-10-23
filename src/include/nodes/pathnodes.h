@@ -683,6 +683,7 @@ typedef struct RelOptInfo
 	List       *unique_pathlist;    /* unique Paths */
 	struct Path *cheapest_startup_path;
 	struct Path *cheapest_total_path;
+	struct Path *cheapest_distinct_unique_path;
 	struct Path *cheapest_unique_path;
 	List	   *cheapest_parameterized_paths;
 

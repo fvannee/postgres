@@ -4745,7 +4745,7 @@ create_distinct_paths(PlannerInfo *root,
 					  RelOptInfo *input_rel)
 {
 	Query	   *parse = root->parse;
-	Path	   *cheapest_input_path = input_rel->cheapest_total_path;
+	Path	   *cheapest_input_path = input_rel->cheapest_distinct_unique_path;
 	RelOptInfo *distinct_rel;
 	double		numDistinctRows;
 	bool		allow_hash;
@@ -4841,6 +4841,12 @@ create_distinct_paths(PlannerInfo *root,
 
 			if (query_has_uniquekeys_for(root, path->uniquekeys, false))
 				add_path(distinct_rel, path);
+			else if (pathkeys_contained_in(needed_pathkeys, path->pathkeys))
+				add_path(distinct_rel, (Path *)
+						 create_upper_unique_path(root, distinct_rel,
+												  path,
+												  list_length(root->distinct_pathkeys),
+												  numDistinctRows));
 		}
 
 		/* For explicit-sort case, always use the more rigorous clause */

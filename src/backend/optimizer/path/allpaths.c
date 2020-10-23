@@ -1829,7 +1829,9 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 		List	   *pathkeys = (List *) lfirst(lcp);
 		List	   *startup_subpaths = NIL;
 		List	   *total_subpaths = NIL;
+		List	   *uniq_total_subpaths = NIL;
 		bool		startup_neq_total = false;
+		bool		uniq_neq_total = false;
 		ListCell   *lcr;
 		bool		match_partition_order;
 		bool		match_partition_order_desc;
@@ -1858,7 +1860,8 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 		{
 			RelOptInfo *childrel = (RelOptInfo *) lfirst(lcr);
 			Path	   *cheapest_startup,
-					   *cheapest_total;
+					   *cheapest_total,
+						*cheapest_uniq_total = NULL;
 
 			/* Locate the right paths, if they are available. */
 			cheapest_startup =
@@ -1874,6 +1877,19 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 											   TOTAL_COST,
 											   false);
 
+			cheapest_uniq_total =
+				get_cheapest_path_for_pathkeys(childrel->unique_pathlist,
+											   pathkeys,
+											   NULL,
+											   TOTAL_COST,
+											   false);
+
+			if (cheapest_uniq_total != NULL && !uniq_neq_total)
+			{
+				uniq_neq_total = true;
+				uniq_total_subpaths = list_copy(total_subpaths);
+			}
+
 			/*
 			 * If we can't find any paths with the right order just use the
 			 * cheapest-total path; we'll have to sort it later.
@@ -1885,6 +1901,9 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 				/* Assert we do have an unparameterized path for this child */
 				Assert(cheapest_total->param_info == NULL);
 			}
+
+			if (cheapest_uniq_total == NULL)
+				cheapest_uniq_total = cheapest_total;
 
 			/*
 			 * Notice whether we actually have different paths for the
@@ -1912,6 +1931,12 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 
 				startup_subpaths = lappend(startup_subpaths, cheapest_startup);
 				total_subpaths = lappend(total_subpaths, cheapest_total);
+
+				if (uniq_neq_total)
+				{
+					cheapest_uniq_total = get_singleton_append_subpath(cheapest_uniq_total);
+					uniq_total_subpaths = lappend(uniq_total_subpaths, cheapest_uniq_total);
+				}
 			}
 			else if (match_partition_order_desc)
 			{
@@ -1925,6 +1950,12 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 
 				startup_subpaths = lcons(cheapest_startup, startup_subpaths);
 				total_subpaths = lcons(cheapest_total, total_subpaths);
+
+				if (uniq_neq_total)
+				{
+					cheapest_uniq_total = get_singleton_append_subpath(cheapest_uniq_total);
+					uniq_total_subpaths = lcons(cheapest_uniq_total, uniq_total_subpaths);
+				}
 			}
 			else
 			{
@@ -1936,6 +1967,11 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 										  &startup_subpaths, NULL);
 				accumulate_append_subpath(cheapest_total,
 										  &total_subpaths, NULL);
+				if (uniq_neq_total)
+				{
+					accumulate_append_subpath(cheapest_uniq_total,
+											  &uniq_total_subpaths, NULL);
+				}
 			}
 		}
 
@@ -1964,6 +2000,17 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 														  false,
 														  partitioned_rels,
 														  -1));
+			if (uniq_neq_total)
+				add_unique_path(rel, (Path *) create_append_path(root,
+														  rel,
+														  uniq_total_subpaths,
+														  NIL,
+														  pathkeys,
+														  NULL,
+														  0,
+														  false,
+														  partitioned_rels,
+														  -1));
 		}
 		else
 		{
@@ -1981,6 +2028,13 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 																pathkeys,
 																NULL,
 																partitioned_rels));
+			if (uniq_neq_total)
+				add_unique_path(rel, (Path *)  create_merge_append_path(root,
+																		rel,
+																		uniq_total_subpaths,
+																		pathkeys,
+																		NULL,
+																		partitioned_rels));
 		}
 	}
 }

@@ -245,6 +245,7 @@ set_cheapest(RelOptInfo *parent_rel)
 {
 	Path	   *cheapest_startup_path;
 	Path	   *cheapest_total_path;
+	Path	   *cheapest_distinct_unique_path;
 	Path	   *best_param_path;
 	List	   *parameterized_paths;
 	ListCell   *p;
@@ -256,6 +257,7 @@ set_cheapest(RelOptInfo *parent_rel)
 
 	cheapest_startup_path = cheapest_total_path = best_param_path = NULL;
 	parameterized_paths = NIL;
+	cheapest_distinct_unique_path = NULL;
 
 	foreach(p, parent_rel->pathlist)
 	{
@@ -354,6 +356,36 @@ set_cheapest(RelOptInfo *parent_rel)
 		cheapest_total_path = best_param_path;
 	Assert(cheapest_total_path != NULL);
 
+	cheapest_distinct_unique_path = cheapest_total_path;
+
+	foreach(p, parent_rel->unique_pathlist)
+	{
+		Path	   *path = (Path *) lfirst(p);
+		int			cmp;
+
+		/* Unparameterized path, so consider it for cheapest slots */
+		if (cheapest_distinct_unique_path == NULL)
+		{
+			cheapest_distinct_unique_path = path;
+			continue;
+		}
+
+		/*
+		 * If we find two paths of identical costs, try to keep the
+		 * better-sorted one.  The paths might have unrelated sort
+		 * orderings, in which case we can only guess which might be
+		 * better to keep, but if one is superior then we definitely
+		 * should keep that one.
+		 */
+		cmp = compare_path_costs(cheapest_distinct_unique_path, path, TOTAL_COST);
+		if (cmp > 0 ||
+			(cmp == 0 &&
+			 compare_pathkeys(cheapest_distinct_unique_path->pathkeys,
+							  path->pathkeys) == PATHKEYS_BETTER2))
+			cheapest_distinct_unique_path = path;
+	}
+
+	parent_rel->cheapest_distinct_unique_path = cheapest_distinct_unique_path;
 	parent_rel->cheapest_startup_path = cheapest_startup_path;
 	parent_rel->cheapest_total_path = cheapest_total_path;
 	parent_rel->cheapest_unique_path = NULL;	/* computed only if needed */
@@ -1266,6 +1298,10 @@ create_append_path(PlannerInfo *root,
 	pathnode->path.parallel_workers = parallel_workers;
 	pathnode->path.pathkeys = pathkeys;
 	pathnode->partitioned_rels = list_copy(partitioned_rels);
+	if (list_length(subpaths) == 1)
+	{
+		pathnode->path.uniquekeys = ((Path*)linitial(subpaths))->uniquekeys;
+	}
 
 	/*
 	 * For parallel append, non-partial paths are sorted by descending total
@@ -1412,6 +1448,10 @@ create_merge_append_path(PlannerInfo *root,
 	pathnode->path.pathkeys = pathkeys;
 	pathnode->partitioned_rels = list_copy(partitioned_rels);
 	pathnode->subpaths = subpaths;
+	if (list_length(subpaths) == 1)
+	{
+		pathnode->path.uniquekeys = ((Path*)linitial(subpaths))->uniquekeys;
+	}
 
 	/*
 	 * Apply query-wide LIMIT if known and path is for sole base relation.
