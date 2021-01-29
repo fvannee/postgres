@@ -551,8 +551,8 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	indexstate = makeNode(IndexOnlyScanState);
 	indexstate->ss.ps.plan = (Plan *) node;
 	indexstate->ss.ps.state = estate;
-	indexstate->ss.ss_FirstTupleEmitted = false;
 	indexstate->ss.ps.ExecProcNode = ExecIndexOnlyScan;
+	indexstate->ss.ss_FirstTupleEmitted = false;
 	indexstate->ioss_SkipPrefixSize = node->indexskipprefixsize;
 	indexstate->ioss_Distinct = node->indexdistinct;
 

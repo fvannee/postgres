@@ -957,6 +957,7 @@ ExecInitIndexScan(IndexScan *node, EState *estate, int eflags)
 	indexstate->ss.ps.plan = (Plan *) node;
 	indexstate->ss.ps.state = estate;
 	indexstate->ss.ps.ExecProcNode = ExecIndexScan;
+	indexstate->ss.ss_FirstTupleEmitted = false;
 	indexstate->iss_SkipPrefixSize = node->indexskipprefixsize;
 	indexstate->iss_Distinct = node->indexdistinct;
 

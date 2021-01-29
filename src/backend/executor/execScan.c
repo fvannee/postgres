@@ -335,6 +335,8 @@ ExecScanReScan(ScanState *node)
 	 */
 	ExecClearTuple(node->ss_ScanTupleSlot);
 
+	node->ss_FirstTupleEmitted = false;
+
 	/* Rescan EvalPlanQual tuple if we're inside an EvalPlanQual recheck */
 	if (estate->es_epq_active != NULL)
 	{

@@ -224,6 +224,7 @@ ExecInitBitmapIndexScan(BitmapIndexScan *node, EState *estate, int eflags)
 	indexstate->ss.ps.plan = (Plan *) node;
 	indexstate->ss.ps.state = estate;
 	indexstate->ss.ps.ExecProcNode = ExecBitmapIndexScan;
+	indexstate->ss.ss_FirstTupleEmitted = false;
 
 	/* normally we don't make the result bitmap till runtime */
 	indexstate->biss_result = NULL;
